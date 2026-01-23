@@ -137,10 +137,19 @@ def image_stream(datapath, image_size=[384, 512], intrinsics_vec=[535.4, 539.2, 
 
         seg_mask_data_ori = cv2.imread(seg_masks[t], cv2.IMREAD_GRAYSCALE)
         seg_mask_data_ori = np.where(seg_mask_data_ori != 12, np.zeros_like(seg_mask_data_ori), np.ones_like(seg_mask_data_ori))
-        kernel = np.ones((8, 8), np.uint8)
-        seg_mask_data = cv2.dilate(seg_mask_data_ori, kernel, iterations=1)
-        seg_mask_data = cv2.resize(seg_mask_data, (image_size[1], image_size[0]))
+        # [FIX] 去掉膨胀，直接用原始 Mask
+        seg_mask_data = seg_mask_data_ori 
+
+        # [FIX] Resize 时增加 interpolation=cv2.INTER_NEAREST 防止边缘模糊产生小数
+        seg_mask_data = cv2.resize(seg_mask_data, (image_size[1], image_size[0]), interpolation=cv2.INTER_NEAREST)
+
         seg_mask_data = torch.from_numpy(seg_mask_data.astype(np.uint8))
+        #8-》3
+        #kernel = np.ones((3, 3), np.uint8)
+        #seg_mask_data = cv2.dilate(seg_mask_data_ori, kernel, iterations=1)
+        ##seg_mask_data = 1 - seg_mask_data
+        #seg_mask_data = cv2.resize(seg_mask_data, (image_size[1], image_size[0]))
+        #seg_mask_data = torch.from_numpy(seg_mask_data.astype(np.uint8))
 
         depth_data = cv2.resize(cv2.imread(depth_paths[t], cv2.IMREAD_UNCHANGED), (image_size[1], image_size[0]))
         depth_data = depth_data.astype(np.float32) / png_depth_scale
@@ -152,7 +161,7 @@ def image_stream(datapath, image_size=[384, 512], intrinsics_vec=[535.4, 539.2, 
 if __name__ == '__main__':
     print('Start Running DG-SLAM....')
     parser = argparse.ArgumentParser()
-    parser.add_argument("--datapath", default="/SSD_DISK/datasets/TUM")
+    parser.add_argument("--datapath", default="./data/TUM")
     parser.add_argument("--weights", default="checkpoints/droid.pth")
     parser.add_argument("--buffer", type=int, default=1000)
     parser.add_argument("--image_size", default=[384,512])
