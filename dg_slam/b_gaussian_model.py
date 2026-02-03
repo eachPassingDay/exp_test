@@ -50,8 +50,9 @@ class GaussianModel():
         self._scaling = None
         self._rotation = None
         self._opacity = None
-        self._creation_frame_id = torch.empty(0) # <--- [NEW] Initialize creation_frame_id
-        self._ghost_count = torch.empty(0)       # [NEW]
+        #ADD
+        self.creation_frames = torch.empty(0).short().cuda()
+
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -119,25 +120,7 @@ class GaussianModel():
 
     def get_opacity(self):
         return self._opacity
-    #[NEW]
-    def get_ghost_count(self):
-        return self._ghost_count
-    #[NEW]
-    def update_ghost_count(self, counts, indices=None):
-        if indices is not None:
-            self._ghost_count[indices] = counts
-        else:
-            self._ghost_count = counts
-    # <--- [NEW] Getter for creation_frame_id
-    def get_creation_frame_id(self):
-        return self._creation_frame_id
     
-    # <--- [NEW] Updater for creation_frame_id
-    def update_creation_frame_id(self, ids, indices=None):
-        if indices is not None:
-            self._creation_frame_id[indices] = ids.detach().clone()
-        else:
-            self._creation_frame_id = ids.detach().clone()
     def get_scaling(self):
         return self._scaling
     
@@ -153,8 +136,9 @@ class GaussianModel():
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+    #ADD 添加current_frame_id = 0
     def add_neural_points(self, batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color,\
-                           train=False, is_pts_grad=False, dynamic_radius=None, current_frame_id=0): # [NEW Arg]
+                           train=False, is_pts_grad=False, dynamic_radius=None, current_frame_id=0):
         """
         Add multiple neural points, will use depth filter when getting these samples.
 
@@ -200,6 +184,9 @@ class GaussianModel():
             self._cloud_pos += pts.tolist()
             self._pts_num += pts.shape[0]
 
+            #ADD
+            new_creation_frames = torch.ones((pts.shape[0]), dtype=torch.int16, device="cuda") * current_frame_id
+
             batch_gt_color = batch_gt_color.unsqueeze(1).repeat(1,self.N_add,1)
             batch_gt_color = batch_gt_color[mask].reshape(-1, 3)
             features = torch.zeros((batch_gt_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -219,12 +206,9 @@ class GaussianModel():
 
             rots = torch.zeros((pts.shape[0], 4), device="cuda")
             rots[:, 0] = 1
-            
+
             opacities = inverse_sigmoid(0.1 * torch.ones((pts.shape[0], 1), dtype=torch.float, device="cuda"))
-            
-            # <--- [NEW] Create frame ID tensor for new points
-            new_ids = torch.full((pts.shape[0], 1), current_frame_id, dtype=torch.int, device="cuda")
-            new_counts = torch.zeros((pts.shape[0], 1), dtype=torch.int, device="cuda")
+
             if self._xyz is None:
                 self._xyz = pts
                 self._features_dc = features[:,:,0:1].transpose(1, 2).contiguous()
@@ -232,8 +216,8 @@ class GaussianModel():
                 self._scaling = scales
                 self._rotation = rots
                 self._opacity = opacities
-                self._creation_frame_id = new_ids # <--- [NEW]
-                self._ghost_count = new_counts  #[NEW]
+                #ADD
+                self.creation_frames = new_creation_frames
                 self.max_radii2D = torch.zeros((pts.shape[0]), device="cuda")
             else:
                 self._xyz = torch.cat((self._xyz, pts), dim=0)
@@ -242,13 +226,38 @@ class GaussianModel():
                 self._scaling = torch.cat((self._scaling, scales), dim=0)
                 self._rotation = torch.cat((self._rotation, rots), dim=0)
                 self._opacity = torch.cat((self._opacity, opacities), dim=0)
-                self._creation_frame_id = torch.cat((self._creation_frame_id, new_ids), dim=0) # <--- [NEW]
-                self._ghost_count = torch.cat((self._ghost_count, new_counts), dim=0) #[NEW]
                 self.max_radii2D = torch.cat((self.max_radii2D, torch.zeros((pts.shape[0]), device="cuda")), dim=0)
+                # ADD
+                self.creation_frames = torch.cat((self.creation_frames, new_creation_frames), dim=0)
+
             return torch.sum(mask)
         else:
             return 0
+    
+    # 请将此方法添加到 GaussianModel 类中
+    def prune_points(self, mask):
+        """
+        根据 mask 删除高斯点。
+        mask: bool tensor, True 表示要删除的点
+        """
+        valid_points_mask = ~mask
+        
+        # 1. 剪枝基础属性
+        self._xyz = self._xyz[valid_points_mask]
+        self._features_dc = self._features_dc[valid_points_mask]
+        self._features_rest = self._features_rest[valid_points_mask]
+        self._opacity = self._opacity[valid_points_mask]
+        self._scaling = self._scaling[valid_points_mask]
+        self._rotation = self._rotation[valid_points_mask]
+        self.max_radii2D = self.max_radii2D[valid_points_mask]
+        
+        # 2. 剪枝新增的 creation_frames 属性
+        if hasattr(self, 'creation_frames'):
+            self.creation_frames = self.creation_frames[valid_points_mask]
 
+        # 注意：这里不需要处理 optimizer，因为我们在 Mapping 结束后调用，
+        # 下一帧 Mapping 会重新创建新的 optimizer。
+        
     def update_xyz(self, feats, indices=None):
         assert torch.is_tensor(feats), 'use tensor to update features'
         if indices is not None:
@@ -292,6 +301,15 @@ class GaussianModel():
             self._rotation[indices] = feats.detach().clone()
         else:
             self._rotation = feats.detach().clone()
+
+    # [NEW] 请添加此方法 (在 update_rotation 附近)
+    def update_max_radii2D(self, radii, indices=None):
+        assert torch.is_tensor(radii), 'use tensor to update radii'
+        if indices is not None:
+            self.max_radii2D[indices] = radii.detach().clone()
+        else:
+            self.max_radii2D = radii.detach().clone()
+
 
     def update_opt(self, opt):
         self.optimizer = opt

@@ -45,9 +45,8 @@ class gs_tracking_mapping():
         self.output = os.path.join(cfg["data"]["output"], self.time_string)
         os.makedirs(self.output, exist_ok=True)
         self.ckptsdir = os.path.join(self.output, 'ckpts')
-        # [新增] 创建剪枝调试目录 (Debug Output Directory)
-        self.debug_prune_dir = os.path.join(self.output, 'debug_pruning')
-        os.makedirs(self.debug_prune_dir, exist_ok=True)
+        ##修改
+        os.makedirs(self.ckptsdir, exist_ok=True)
 
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = cfg['cam']['H'], cfg['cam'][
             'W'], cfg['cam']['fx'], cfg['cam']['fy'], cfg['cam']['cx'], cfg['cam']['cy']
@@ -131,9 +130,6 @@ class gs_tracking_mapping():
         self.gaussians_opacity = None
         self.gaussians_scaling = None
         self.gaussians_rotation = None
-        self.gaussians_creation_frame_id = None # <--- [NEW]
-        self.gaussians_ghost_count = None       # [NEW]
-
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -176,12 +172,153 @@ class gs_tracking_mapping():
         self.inv_pose = None
 
         self.exposure_feat_all = ([] if self.encode_exposure else None)
+        # [ADD] 新增：缓存最近几帧的 Mask 和 Depth/Pose，用于时空回溯检查
+        # 格式: {frame_idx: {'mask': tensor, 'depth': tensor, 'c2w': tensor, 'fx': float...}}
+        self.temporal_mask_cache = {} 
+        self.max_cache_size = 20 # 缓存窗口大小，避免爆内存
         
         self.print_output_desc()
 
     def print_output_desc(self):
         print(f"⭐️ 🌙  mapping begin!!")
 
+    def perform_temporal_mask_pruning(self, current_frame_idx, check_window=5):
+        """
+        [Strategy Update v3] 基于"物体中位数深度"的时空剪枝
+        
+        核心思想 (User Idea): 
+        计算当前帧动态物体的深度中位数 (obj_median)。
+        1. 保护背景: 凡是深度显著大于 obj_median (如 > +0.8m) 的点，视为墙面，强制保留。
+        2. 清除鬼影: 在 Mask 范围内，且深度接近或小于 obj_median 的点，视为鬼影，删除。
+        """
+        debug_dir = os.path.join(self.output, "debug_pruning")
+        os.makedirs(debug_dir, exist_ok=True)
+
+        is_full_purge = (current_frame_idx % 30 == 0)
+        
+        if is_full_purge:
+            suspect_mask = torch.ones(self.gaussians.get_xyz().shape[0], dtype=torch.bool, device=self.device)
+        else:
+            # 检查最近生成的点
+            start_check = max(0, current_frame_idx - 20)
+            suspect_mask = (self.gaussians.creation_frames >= start_check)
+
+        if suspect_mask.sum() == 0: return
+
+        suspect_indices = torch.nonzero(suspect_mask).squeeze()
+        if suspect_indices.dim() == 0: suspect_indices = suspect_indices.unsqueeze(0)
+        points_xyz = self.gaussians.get_xyz()[suspect_indices]
+        
+        final_prune_mask_local = torch.zeros(points_xyz.shape[0], dtype=torch.bool, device=self.device)
+        
+        available_frames = sorted(list(self.temporal_mask_cache.keys()))
+        check_frames = [f for f in available_frames if f < current_frame_idx][-check_window:]
+        if current_frame_idx in self.temporal_mask_cache:
+            check_frames.append(current_frame_idx)
+
+        for frame_id in check_frames:
+            data = self.temporal_mask_cache[frame_id]
+            
+            mask_person_dilated = data['mask'] # 1=Person+Edge, 0=Bg
+            depth_gt = data['depth']
+            c2w = data['c2w']
+            fx, fy, cx, cy = data['intrinsics']
+            H, W = self.H, self.W
+
+            # --- [关键步骤] 计算物体深度中位数 ---
+            # 为了计算准确，我们先"腐蚀"一下 Mask，只取核心区域算深度，避免把边缘的墙算进去
+            mask_dilated_np = mask_person_dilated.cpu().numpy().astype(np.uint8)
+            kernel = np.ones((5, 5), np.uint8)
+            mask_core_np = cv2.erode(mask_dilated_np, kernel, iterations=3)
+            mask_core = torch.from_numpy(mask_core_np).bool().to(self.device)
+            
+            # 提取核心区的深度值
+            if mask_core.sum() > 0:
+                obj_depths = depth_gt[mask_core]
+                valid_obj_depths = obj_depths[obj_depths > 0.1]
+                if valid_obj_depths.numel() > 5:
+                    obj_median = valid_obj_depths.median().item()
+                else:
+                    obj_median = None
+            else:
+                obj_median = None
+            
+            # 如果算不出中位数（比如人太远或mask太小），这帧就跳过，避免误删
+            if obj_median is None: continue
+
+            # --- 投影 ---
+            w2c = torch.inverse(c2w)
+            ones = torch.ones((points_xyz.shape[0], 1), device=self.device)
+            xyz_homo = torch.cat([points_xyz, ones], dim=1).unsqueeze(2)
+            cam_cord = torch.matmul(w2c, xyz_homo)[:, :3, 0]
+            z = cam_cord[:, 2]
+            u = ((cam_cord[:, 0] * fx) / z + cx).long()
+            v = ((cam_cord[:, 1] * fy) / z + cy).long()
+            
+            valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z > 0.1)
+            cur_u = u[valid_uv]
+            cur_v = v[valid_uv]
+            cur_z = z[valid_uv]
+            
+            if cur_u.shape[0] == 0: continue
+
+            # --- 判定逻辑 (User's Logic) ---
+            
+            # 1. 必须在膨胀后的 Mask (Kill Zone) 内
+            in_kill_zone = mask_person_dilated[cur_v, cur_u]
+            
+            # 2. 深度判定：与 obj_median 比较
+            # 保护阈值：比如人厚度约 0.5m。
+            # 如果 cur_z > obj_median + 0.8m，那肯定是人后面的墙 -> 保护
+            # 如果 cur_z <= obj_median + 0.8m，那可能是人或鬼影 -> 删
+            safe_margin = 0.8 
+            is_background_wall = cur_z > (obj_median + safe_margin)
+            
+            # 决策：在区域内 且 不是背景墙
+            should_prune = in_kill_zone & (~is_background_wall)
+
+            # --- 记录 ---
+            valid_indices_local = torch.nonzero(valid_uv).squeeze()
+            prune_indices_in_valid = torch.nonzero(should_prune).squeeze()
+            
+            if prune_indices_in_valid.numel() > 0:
+                if valid_indices_local.dim() == 0: valid_indices_local = valid_indices_local.unsqueeze(0)
+                if prune_indices_in_valid.dim() == 0: prune_indices_in_valid = prune_indices_in_valid.unsqueeze(0)
+                indices_to_mark = valid_indices_local[prune_indices_in_valid]
+                final_prune_mask_local[indices_to_mark] = True
+
+            # --- Visualization ---
+            if frame_id == current_frame_idx or (is_full_purge and frame_id % 10 == 0):
+                vis_img = cv2.cvtColor(mask_dilated_np * 255, cv2.COLOR_GRAY2BGR)
+                
+                # 画出 Core 区域 (绿色轮廓) - 用于计算中位数的区域
+                contours, _ = cv2.findContours(mask_core_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(vis_img, contours, -1, (0, 255, 0), 1)
+
+                u_np = cur_u.cpu().numpy()
+                v_np = cur_v.cpu().numpy()
+                prune_np = should_prune.cpu().numpy()
+                
+                # 蓝色：因深度大于中位数而被保护的点 (背景墙)
+                protected_np = in_kill_zone.cpu().numpy() & is_background_wall.cpu().numpy()
+                
+                # 绘制
+                if protected_np.sum() > 0: # Blue
+                     vis_img[v_np[protected_np], u_np[protected_np]] = [255, 0, 0]
+                if prune_np.sum() > 0: # Red
+                     vis_img[v_np[prune_np], u_np[prune_np]] = [0, 0, 255]
+
+                info = f"ObjMed: {obj_median:.2f}m | Safe > {obj_median+safe_margin:.2f}m"
+                cv2.putText(vis_img, info, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.imwrite(os.path.join(debug_dir, f"prune_v3_curr{current_frame_idx}_view{frame_id}.jpg"), vis_img)
+        
+        if final_prune_mask_local.sum() > 0:
+            global_indices_to_prune = suspect_indices[final_prune_mask_local]
+            reset_opacity_val = -100.0 
+            with torch.no_grad():
+                self.gaussians._opacity[global_indices_to_prune] = reset_opacity_val
+            print(f"[Pruning] Frame {current_frame_idx}: Removed {final_prune_mask_local.sum().item()} points.")
+            
     def update_scale(self):
         self.H *= self.scale_factor
         self.W *= self.scale_factor
@@ -247,11 +384,10 @@ class gs_tracking_mapping():
         self.gaussians_scaling_grad = optimizable_tensors["scaling"]
         self.gaussians_rotation_grad = optimizable_tensors["rotation"]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        # <--- [NEW] Sync pruning for creation_frame_id
-        if self.gaussians_creation_frame_id is not None:
-             self.gaussians_creation_frame_id = self.gaussians_creation_frame_id[valid_points_mask]
-        if self.gaussians_ghost_count is not None:
-             self.gaussians_ghost_count = self.gaussians_ghost_count[valid_points_mask]
+        # [NEW] 同步剪枝本地的 creation_frames
+        # 注意：这里改名为 creation_frames_opt 以区分
+        if hasattr(self, 'creation_frames_opt'):
+            self.creation_frames_opt = self.creation_frames_opt[valid_points_mask]
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
@@ -388,8 +524,8 @@ class gs_tracking_mapping():
         get_opacity = self.opacity_activation(self.gaussians_opacity_grad)
         opacities_new = inverse_sigmoid(torch.min(get_opacity, torch.ones_like(get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
-        self.gaussians_opacity_grad = optimizable_tensors["opacity"]    
-
+        self.gaussians_opacity_grad = optimizable_tensors["opacity"]        
+    
     def optimize_cur_map(self, num_joint_iters, idx, cur_gt_color, cur_gt_depth, gt_cur_c2w, cur_c2w, color_refine=False, seg_mask = None):
         H, W, fx, fy, cx, cy = self.H, self.W, self.fx, self.fy, self.cx, self.cy
         init = True if idx == 0 else False
@@ -399,24 +535,16 @@ class gs_tracking_mapping():
         gt_depth = cur_gt_depth
         gt_color = cur_gt_color
 
-        # ==============================================================================================
-        # 1. 自适应增点 (Adaptive Densification)
-        # ==============================================================================================
         if idx == 0:
             add_pts_num = torch.clamp(self.pixels_adding * ((gt_depth.median() / 2.5) ** 2),
                                       min=self.pixels_adding, max=self.pixels_adding * 3).int().item() * 2
         else:
-            add_pts_num = max(self.pixels_adding // 5, 600)
+            add_pts_num = self.pixels_adding // 10
 
-        # 修正: Mask 直接使用传入的 seg_mask (1=Static)
-        refined_mask = seg_mask
-
-        # 随机采样 (Random Sampling)
         batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples(
             0, H, 0, W, add_pts_num,
-            fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device, depth_filter=True, return_index=True, seg_mask = refined_mask)
+            fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device, depth_filter=True, return_index=True, seg_mask = seg_mask)
         
-        # --- Warp Logic ---
         keyframe_len = idx
         warp_window = 3
         warp_depth_img_batch = []
@@ -458,76 +586,48 @@ class gs_tracking_mapping():
             i = i[batch_mask]
             j = j[batch_mask]
         
-        # [Fix] Initialize frame_pts_add
-        frame_pts_add = 0
-
         if not color_refine:
+            #ADD
+            frame_pts_add = 0
             _ = self.gaussians.add_neural_points(batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color,
                                                  dynamic_radius=self.dynamic_r_add[
-                                                     j, i] if self.use_dynamic_radius else None,
-                                                 current_frame_id=idx.item())
-            frame_pts_add += _  # Accumulate added points
-
-            # ======================================================================================
-            # 2. 梯度采样 + 静态遮罩门禁
-            # ======================================================================================
+                                                     j, i] if self.use_dynamic_radius else None, current_frame_id=idx.item())
+            frame_pts_add += _
             if self.pixels_based_on_color_grad > 0:
                 batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples_with_pixel_grad(
                     0, H, 0, W, self.pixels_based_on_color_grad,
                     H, W, fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device,
                     depth_filter=True, return_index=True)
-                
-                # 边界安全检查 + Mask 过滤
-                if refined_mask is not None:
-                    MH, MW = refined_mask.shape
-                    valid_mask_indices = (i >= 0) & (i < MH) & (j >= 0) & (j < MW)
-                    
-                    is_static = torch.zeros_like(i, dtype=torch.bool)
-                    
-                    if valid_mask_indices.any():
-                        valid_i = i[valid_mask_indices]
-                        valid_j = j[valid_mask_indices]
-                        is_static[valid_mask_indices] = refined_mask[valid_i, valid_j]
-
-                    if is_static.sum() > 0:
-                        _ = self.gaussians.add_neural_points(
-                            batch_rays_o[is_static], batch_rays_d[is_static], 
-                            batch_gt_depth[is_static], batch_gt_color[is_static], 
-                            is_pts_grad=True, 
-                            dynamic_radius=self.dynamic_r_add[j[is_static], i[is_static]] if self.use_dynamic_radius else None,
-                            current_frame_id=idx.item()
-                        )
-                        frame_pts_add += _  # Accumulate
-                else:
-                    _ = self.gaussians.add_neural_points(
-                        batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, 
-                        is_pts_grad=True, 
-                        dynamic_radius=self.dynamic_r_add[j, i] if self.use_dynamic_radius else None,
-                        current_frame_id=idx.item()
-                    )
-                    frame_pts_add += _  # Accumulate
+                _ = self.gaussians.add_neural_points(batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, \
+                                                     is_pts_grad=True, dynamic_radius=self.dynamic_r_add[
+                        j, i] if self.use_dynamic_radius else None, current_frame_id=idx.item())
+                frame_pts_add += _
 
             if self.pixels_based_on_render and idx > 0:
                 with torch.no_grad():
                     camera_center = cur_c2w[:3, 3]
                     world_view_transform = torch.inverse(cur_c2w).transpose(0, 1)
-                    render_pkg = render(self.gaussians.get_xyz(), self.gaussians.get_features_dc(), self.gaussians.get_features_rest(),
-                                        self.opacity_activation(self.gaussians.get_opacity()), 
-                                        self.scaling_activation(self.gaussians.get_scaling()),
-                                        self.rotation_activation(self.gaussians.get_rotation()),
+                    gaussians_opacity_activation = self.opacity_activation(self.gaussians_opacity)
+                    gaussians_scaling_activation = self.scaling_activation(self.gaussians_scaling)
+                    gaussians_rotation_activation = self.rotation_activation(self.gaussians_rotation)
+                    render_pkg = render(self.gaussians_xyz, self.gaussians_features_dc, self.gaussians_features_rest, \
+                                        gaussians_opacity_activation, gaussians_scaling_activation,
+                                        gaussians_rotation_activation, \
                                         self.gaussians.get_active_sh_degree(), self.gaussians.get_max_sh_degree(),
-                                        camera_center, world_view_transform, self.projection_matrix, self.fovx, self.fovy, self.H, self.W)
-                    
+                                        camera_center, world_view_transform, \
+                                        self.projection_matrix, self.fovx, self.fovy, self.H, self.W)
+
+                    image_render, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[
+                        "viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                     depth_render = render_pkg["depth"][0]
-                    image_render = render_pkg["render"].permute(1, 2, 0)
+                    image_render = image_render.permute(1, 2, 0)
                     opacity_render = render_pkg["acc"][0]
                     
                     batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples_point_add(
                         depth_render, image_render, opacity_render, 6000, self.add_pixel_depth_th, 0, H, 0, W,
                         H, W, fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device,
-                        depth_filter=True, return_index=True, seg_mask = refined_mask)
+                        depth_filter=True, return_index=True, seg_mask = seg_mask)
 
-                    # --- Render Warp Logic ---
                     keyframe_len = idx
                     warp_window = 3
                     warp_depth_img_batch = []
@@ -570,34 +670,22 @@ class gs_tracking_mapping():
                         j = j[batch_mask]
                     
                     _ = self.gaussians.add_neural_points(batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color,
-                                                         dynamic_radius=self.dynamic_r_add[j, i] if self.use_dynamic_radius else None,
-                                                         current_frame_id=idx.item())
-                    frame_pts_add += _  # Accumulate
+                                                         dynamic_radius=self.dynamic_r_add[
+                                                             j, i] if self.use_dynamic_radius else None, current_frame_id=idx.item())
+                    frame_pts_add += _
 
-        # ==============================================================================================
-        # 3. 准备数据 (Seen/Unseen)
-        # ==============================================================================================
         self.gaussians_xyz = self.gaussians.get_xyz()
         self.gaussians_features_dc = self.gaussians.get_features_dc()
         self.gaussians_features_rest = self.gaussians.get_features_rest()
         self.gaussians_opacity = self.gaussians.get_opacity()
         self.gaussians_scaling = self.gaussians.get_scaling()
         self.gaussians_rotation = self.gaussians.get_rotation()
-        self.gaussians_creation_frame_id = self.gaussians.get_creation_frame_id() 
-        self.gaussians_ghost_count = self.gaussians.get_ghost_count()
+        # [NEW] 1. 获取 creation_frames
+        self.creation_frames = self.gaussians.creation_frames
 
         masked_c_grad = {}
         mask_c2w = cur_c2w
         indices, indices_unseen = self.get_mask_from_c2w(mask_c2w, gt_depth_np)
-
-        gaussians_xyz_unfrustum = self.gaussians_xyz[indices_unseen].detach().clone()
-        gaussians_features_dc_unfrustum = self.gaussians_features_dc[indices_unseen].detach().clone()
-        gaussians_features_rest_unfrustum = self.gaussians_features_rest[indices_unseen].detach().clone()
-        gaussians_opacity_unfrustum = self.gaussians_opacity[indices_unseen].detach().clone()
-        gaussians_scaling_unfrustum = self.gaussians_scaling[indices_unseen].detach().clone()
-        gaussians_rotation_unfrustum = self.gaussians_rotation[indices_unseen].detach().clone()
-        gaussians_creation_id_unfrustum = self.gaussians_creation_frame_id[indices_unseen].detach().clone()
-        gaussians_ghost_count_unfrustum = self.gaussians_ghost_count[indices_unseen].detach().clone()
 
         self.gaussians_xyz_grad = self.gaussians_xyz[indices].detach().clone().requires_grad_(True)
         self.gaussians_features_dc_grad = self.gaussians_features_dc[indices].detach().clone().requires_grad_(True)
@@ -605,13 +693,15 @@ class gs_tracking_mapping():
         self.gaussians_opacity_grad = self.gaussians_opacity[indices].detach().clone().requires_grad_(True)
         self.gaussians_scaling_grad = self.gaussians_scaling[indices].detach().clone().requires_grad_(True)
         self.gaussians_rotation_grad = self.gaussians_rotation[indices].detach().clone().requires_grad_(True)
-        self.gaussians_creation_frame_id = self.gaussians_creation_frame_id[indices].detach().clone()
-        self.gaussians_ghost_count = self.gaussians_ghost_count[indices].detach().clone()
-        
+
+        # [NEW] 2. 准备用于当前优化的 creation_frames 副本 (注意也要切片 indices)
+        self.creation_frames_opt = self.creation_frames[indices].detach().clone()
+
         masked_c_grad['indices'] = indices
 
         if self.encode_exposure:
             mlp_exposure_para_list += list(self.mlp_exposure.parameters())
+
         optim_para_list = [
             {'params': [self.gaussians_xyz_grad], 'lr': self.position_lr_init, "name": "xyz"},
             {'params': [self.gaussians_features_dc_grad], 'lr': self.feature_lr, "name": "f_dc"},
@@ -620,18 +710,22 @@ class gs_tracking_mapping():
             {'params': [self.gaussians_scaling_grad], 'lr': self.scaling_lr, "name": "scaling"},
             {'params': [self.gaussians_rotation_grad], 'lr': self.rotation_lr, "name": "rotation"}
         ]
+
         if self.encode_exposure:
-            optim_para_list.append({'params': self.exposure_feat, 'lr': 0.001, "name": "expos_feat"})
-            optim_para_list.append({'params': mlp_exposure_para_list, 'lr': 0.005, "name": "mlp_expos_para"})
+            optim_para_list.append(
+                {'params': self.exposure_feat, 'lr': 0.001, "name": "expos_feat"})
+            optim_para_list.append(
+                {'params': mlp_exposure_para_list, 'lr': 0.005, "name": "mlp_expos_para"})
+
         self.optimizer = torch.optim.Adam(optim_para_list)
 
         if idx > 0 and not color_refine:
             num_joint_iters = 60
             num_joint_iters = np.clip(int(num_joint_iters * frame_pts_add / 5000), int(
                 self.min_iter_ratio * num_joint_iters), 2 * num_joint_iters)
-        
-        num_joint_iters = max(num_joint_iters, 60)
-        
+        total_gs_point_num = self.gaussians.get_xyz().shape[0]
+        print('total gaussian points number: ', f'{total_gs_point_num}')
+
         actual_joint_iters = 0
 
         for joint_iter in range(num_joint_iters):
@@ -682,8 +776,8 @@ class gs_tracking_mapping():
             
             if joint_iter % 30 == 0:
                 self.gaussians.oneupSHdegree()
-
-            mask = (gt_depth > 0.0) & (gt_depth < 8.) & refined_mask
+            '''
+            mask = (gt_depth > 0.0) & (gt_depth < 8.) & seg_mask
             mask = mask & (~torch.isnan(gt_depth))
             depths_wmask = depth[mask]
             gt_depths_wmask = gt_depth[mask]
@@ -698,17 +792,65 @@ class gs_tracking_mapping():
             loss += weighted_ssim_loss
             weighted_color_loss = self.w_color_loss * color_loss * (1 - self.lambda_ssim_loss)
             loss += weighted_color_loss
+            '''
+
+            # ================= [关键修改开始] =================
+            
+            # 1. 基础合法性 (移除 8.0m 的上限，改为更大的值比如 30m，或者干脆去掉)
+            valid_mask = (gt_depth > 0.0) & (gt_depth < 40.) & (~torch.isnan(gt_depth))
+            
+            # 如果有语义掩码，先应用语义约束 (Background=1)
+            if seg_mask is not None:
+                valid_mask = valid_mask & seg_mask
+
+            # 2. 单向深度一致性校验 (One-way Depth Consistency)
+            # 核心逻辑：
+            # Case A: GT(2m) < Render(5m) -> 观测比地图近 -> 这是一个挡在墙前面的人 -> 剔除(False)
+            # Case B: GT(10m) > Render(0m) -> 观测比地图远(新区域) -> 这是一个新墙 -> 保留(True)
+            # Case C: GT(5m) ≈ Render(5m) -> 一致 -> 保留(True)
+            
+            # 只有当 (GT < Render - margin) 时，才认为是异常遮挡
+            # margin 设为 0.5 米
+            is_dynamic_occlusion = gt_depth < (depth - 0.5)
+            
+            # 鲁棒遮罩 = 基础合法 & 不是动态遮挡
+            robust_mask = valid_mask & (~is_dynamic_occlusion)
+
+            # [关键] 更新 mask 变量，供后续 loss 计算和 logging 使用
+            mask = robust_mask
+            
+            # [关键] 防止除以 0 报错 (你之前的报错点)
+            mask_sum = mask.sum().item()
+            if mask_sum < 10: 
+                continue # 像素太少，跳过本次迭代
+            
+            # ================= [End of Fix] =================
+
+            # Loss 计算 (注意分母归一化)
+            depths_wmask = depth[mask]
+            gt_depths_wmask = gt_depth[mask]
+            geo_loss = torch.abs(gt_depths_wmask - depths_wmask).sum()
+            
+            color_mask = mask
+            color_loss = torch.abs(gt_color[color_mask] - image[color_mask]).sum()
+            
+            ssim_loss = (1.0 - ssim(image.permute(2, 0, 1), gt_color.permute(2, 0, 1).float()))
+            
+            # 归一化 Loss (防止因为 mask 大小变化导致 loss 震荡)
+            # 加上一个极小值 eps 防止除0
+            loss_scale = 1.0 / (mask_sum + 1e-6)
+            
+            loss = (geo_loss * self.w_geo_loss + 
+                   self.w_color_loss * color_loss * (1 - self.lambda_ssim_loss)) * loss_scale
+            loss += self.lambda_ssim_loss * ssim_loss
+            
+            # ================= [关键修改结束] =================
 
             loss.backward(retain_graph=False)
-            
             self.max_radii2D = radii
-            with torch.no_grad():
-                #if joint_iter == num_joint_iters - 1:
-                     #self.prune_dynamic_ghosting(cur_c2w, cur_gt_depth, cur_gt_color, refined_mask, idx.item(), age_thres=0)
-
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                actual_joint_iters += 1
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            actual_joint_iters += 1
 
             total_gs_point_num_prune = self.gaussians_xyz.shape[0]
             if not self.wandb:
@@ -730,15 +872,27 @@ class gs_tracking_mapping():
                     wandb.log({'idx_map': int(idx.item()),
                                'num_joint_iters': num_joint_iters})
 
-        self.gaussians_xyz = torch.cat((self.gaussians_xyz_grad.detach().clone(), gaussians_xyz_unfrustum.detach().clone()), 0)
-        self.gaussians_features_dc = torch.cat((self.gaussians_features_dc_grad.detach().clone(), gaussians_features_dc_unfrustum.detach().clone()), 0)
-        self.gaussians_features_rest = torch.cat((self.gaussians_features_rest_grad.detach().clone(), gaussians_features_rest_unfrustum.detach().clone()), 0)
-        self.gaussians_opacity = torch.cat((self.gaussians_opacity_grad.detach().clone(), gaussians_opacity_unfrustum.detach().clone()), 0)
-        self.gaussians_scaling = torch.cat((self.gaussians_scaling_grad.detach().clone(), gaussians_scaling_unfrustum.detach().clone()), 0)
-        self.gaussians_rotation = torch.cat((self.gaussians_rotation_grad.detach().clone(), gaussians_rotation_unfrustum.detach().clone()), 0)
-        
-        self.gaussians_creation_frame_id = torch.cat((self.gaussians_creation_frame_id, gaussians_creation_id_unfrustum), 0)
-        self.gaussians_ghost_count = torch.cat((self.gaussians_ghost_count, gaussians_ghost_count_unfrustum), 0)
+        if self.frustum_feature_selection:
+            indices = masked_c_grad['indices']
+            self.gaussians_xyz[indices] = self.gaussians_xyz_grad.detach().clone()
+            self.gaussians_features_dc[indices] = self.gaussians_features_dc_grad.detach().clone()
+            self.gaussians_features_rest[indices] = self.gaussians_features_rest_grad.detach().clone()
+            self.gaussians_opacity[indices] = self.gaussians_opacity_grad.detach().clone()
+            self.gaussians_scaling[indices] = self.gaussians_scaling_grad.detach().clone()
+            self.gaussians_rotation[indices] = self.gaussians_rotation_grad.detach().clone()
+            # [NEW] 写回 creation_frames
+            # 注意：如果发生了剪枝，indices 长度可能不匹配，但这属于 DG-SLAM 原有逻辑潜在问题
+            # 我们假设这里逻辑与 xyz 一致
+            self.creation_frames[indices] = self.creation_frames_opt.detach().clone()
+        else:
+            self.gaussians_xyz = self.gaussians_xyz_grad.detach().clone()
+            self.gaussians_features_dc = self.gaussians_features_dc_grad.detach().clone()
+            self.gaussians_features_rest = self.gaussians_features_rest_grad.detach().clone()
+            self.gaussians_opacity = self.gaussians_opacity_grad.detach().clone()
+            self.gaussians_scaling = self.gaussians_scaling_grad.detach().clone()
+            self.gaussians_rotation = self.gaussians_rotation_grad.detach().clone()
+            # [NEW] 写回
+            self.creation_frames = self.creation_frames_opt.detach().clone()
 
         self.gaussians.update_xyz(self.gaussians_xyz.detach().clone())
         self.gaussians.update_features_dc(self.gaussians_features_dc.detach().clone())
@@ -746,239 +900,25 @@ class gs_tracking_mapping():
         self.gaussians.update_scaling(self.gaussians_scaling.detach().clone())
         self.gaussians.update_rotation(self.gaussians_rotation.detach().clone())
         self.gaussians.update_opacity(self.gaussians_opacity.detach().clone())
-        
-        self.gaussians.update_creation_frame_id(self.gaussians_creation_frame_id.detach().clone())
-        self.gaussians.update_ghost_count(self.gaussians_ghost_count.detach().clone())
-        
-        print('Current Map has been updated (Pruning Active)')
-        # [新增可视化实验 1] 验证"糊"：可视化高斯点在当前视角的分布
-        # ---------------------------------------------------------
-        if idx % 10 == 0:  # 每10帧保存一次，避免IO太慢
-            with torch.no_grad():
-                try:
-                    # 1. 获取当前所有高斯点
-                    xyz = self.gaussians.get_xyz()
-                    
-                    # 2. 投影到当前相机平面
-                    # World -> Camera
-                    w2c = torch.inverse(cur_c2w)
-                    R = w2c[:3, :3]
-                    T = w2c[:3, 3]
-                    pts_cam = (xyz @ R.T) + T
-                    x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
-                    
-                    # 3. 过滤掉背后的点和太远的点
-                    valid_mask = (z > 0.01) & (z < 10.0)
-                    u = (x[valid_mask] / z[valid_mask] * self.fx + self.cx).long()
-                    v = (y[valid_mask] / z[valid_mask] * self.fy + self.cy).long()
-                    
-                    # 4. 过滤掉图像外的点
-                    H, W = self.H, self.W
-                    valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-                    u = u[valid_uv].cpu().numpy()
-                    v = v[valid_uv].cpu().numpy()
-                    
-                    # 5. 绘制
-                    # 创建一个黑色背景图
-                    viz_img = np.zeros((H, W, 3), dtype=np.uint8)
-                    # 将点绘制为白色 (或者根据深度绘制颜色)
-                    viz_img[v, u] = [255, 255, 255]
-                    
-                    # 保存
-                    save_dir = os.path.join(self.output, 'debug_distribution')
-                    os.makedirs(save_dir, exist_ok=True)
-                    cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_points.png'), viz_img)
-                    
-                except Exception as e:
-                    print(f"Viz Error 1: {e}")
-        # ---------------------------------------------------------
+        # [NEW] 同步 max_radii2D (修复 IndexError)
+        # [FIXED] 正确更新 max_radii2D
+        # optimize_cur_map 始终基于 masked_c_grad['indices'] 进行局部优化
+        # 所以必须传入 indices 进行局部更新，否则会把局部的 radii 覆盖给全局，导致长度错误
+        if self.max_radii2D is not None:
+            indices = masked_c_grad['indices']
+            # 确保 indices 长度和当前 radii 长度匹配（通常是匹配的，除非 render 出了问题）
+            if self.max_radii2D.shape[0] == len(indices):
+                self.gaussians.update_max_radii2D(self.max_radii2D.float().detach().clone(), indices=indices)
+            else:
+                # 理论上不应发生，但为了安全
+                pass
+        # [NEW] 手动更新 model 中的 creation_frames
+        self.gaussians.creation_frames = self.creation_frames.detach().clone()
+        print('Current Map has been updated')
 
-        # [新增可视化实验 2] 验证"鬼影"：可视化深度残差图
-        # ---------------------------------------------------------
-        if idx % 10 == 0:
-            with torch.no_grad():
-                try:
-                    # 1. 渲染当前视角的深度
-                    camera_center = cur_c2w[:3, 3]
-                    world_view_transform = torch.inverse(cur_c2w).transpose(0, 1)
-                    
-                    # 使用正常的 opacity (不 boost) 来观察真实渲染情况
-                    render_pkg = render(self.gaussians.get_xyz(), 
-                                        self.gaussians.get_features_dc(), 
-                                        self.gaussians.get_features_rest(),
-                                        self.opacity_activation(self.gaussians.get_opacity()), 
-                                        self.scaling_activation(self.gaussians.get_scaling()),
-                                        self.rotation_activation(self.gaussians.get_rotation()),
-                                        self.gaussians.get_active_sh_degree(), 
-                                        self.gaussians.get_max_sh_degree(),
-                                        camera_center, world_view_transform, self.projection_matrix, 
-                                        self.fovx, self.fovy, self.H, self.W)
-                    
-                    depth_render = render_pkg["depth"][0] # [H, W]
-                    
-                    # 2. 计算残差 (GT - Render)
-                    # 我们只关心 GT > Render 的情况 (遮挡/鬼影)
-                    # 或者是绝对差值
-                    diff = cur_gt_depth - depth_render
-                    
-                    # 3. 归一化以便可视化
-                    # 设定一个观察范围，例如 [-0.5m, 0.5m]
-                    diff_np = diff.cpu().numpy()
-                    
-                    # 制作热力图: 
-                    # 正值(红/暖色) = Render太近(鬼影挡路)
-                    # 负值(蓝/冷色) = Render太远(穿透)
-                    # 0值(白/灰) = 准确
-                    
-                    # 简单的灰度图可视化 (绝对误差)
-                    diff_abs = np.abs(diff_np)
-                    diff_vis = np.clip(diff_abs / 0.5, 0, 1) * 255 # 0.5m 对应 255
-                    diff_vis = diff_vis.astype(np.uint8)
-                    diff_heatmap = cv2.applyColorMap(diff_vis, cv2.COLORMAP_JET)
-                    
-                    # 另外保存一个 Signed Difference (有符号差值)
-                    # Shift 0 to 127
-                    diff_signed = np.clip((diff_np + 0.5) / 1.0 * 255, 0, 255).astype(np.uint8)
-                    
-                    save_dir = os.path.join(self.output, 'debug_residual')
-                    os.makedirs(save_dir, exist_ok=True)
-                    cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_diff_abs.png'), diff_heatmap)
-                    cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_diff_signed.png'), diff_signed)
-                    
-                except Exception as e:
-                    print(f"Viz Error 2: {e}")
-        # ---------------------------------------------------------
         if self.encode_exposure and idx == (self.n_img - 1):
             self.exposure_feat_all.append(self.exposure_feat.detach().cpu())
         return None
-
-    def prune_dynamic_ghosting(self, cur_c2w, gt_depth, gt_color, seg_mask, current_frame_idx, age_thres=0):
-        """
-        修正版 V6：加入 Opacity Boosting Trick
-        目的：强制让半透明的鬼影变"实"，以便深度检测能捕捉到它们。
-        """
-        with torch.no_grad():
-            # 1. 渲染 (Trick: Opacity Boosting)
-            camera_center = cur_c2w[:3, 3]
-            world_view_transform = torch.inverse(cur_c2w).transpose(0, 1)
-            
-            # [关键 Trick] 放大透明度
-            opacity = self.opacity_activation(self.gaussians_opacity_grad)
-            boosted_opacity = torch.clamp(opacity * 10.0, max=0.999)
-            
-            render_pkg = render(self.gaussians_xyz_grad, self.gaussians_features_dc_grad, self.gaussians_features_rest_grad,
-                                boosted_opacity, # 使用 Boost 后的透明度
-                                self.scaling_activation(self.gaussians_scaling_grad),
-                                self.rotation_activation(self.gaussians_rotation_grad),
-                                self.gaussians.get_active_sh_degree(), self.gaussians.get_max_sh_degree(),
-                                camera_center, world_view_transform, self.projection_matrix, 
-                                self.fovx, self.fovy, self.H, self.W)
-            
-            depth_render = render_pkg["depth"][0]
-            
-            # ==============================================================================
-            # 深度边缘检测 (Edge Protection)
-            # ==============================================================================
-            g_depth = gt_depth
-            dy = torch.abs(g_depth[1:, :] - g_depth[:-1, :])
-            dx = torch.abs(g_depth[:, 1:] - g_depth[:, :-1])
-            dy = torch.nn.functional.pad(dy, (0, 0, 0, 1))
-            dx = torch.nn.functional.pad(dx, (0, 1, 0, 0))
-            edge_mask = (dy > 0.1) | (dx > 0.1)
-
-            # ==============================================================================
-            # 2. 判定逻辑
-            # ==============================================================================
-            depth_diff = gt_depth - depth_render
-            
-            # 物理遮挡: 渲染比真值近 5cm
-            is_blocking = (depth_diff > 0.05) & (gt_depth > 0)
-            
-            # 鬼影判定: 物理挡路 & 语义背景 & 非边缘
-            pixel_guilty_mask = is_blocking & seg_mask & (gt_depth > 0) & (~edge_mask)
-            
-            # 洗白判定
-            pixel_innocent_mask = (torch.abs(depth_diff) < 0.02) & (gt_depth > 0)
-
-            if pixel_guilty_mask.sum() == 0:
-                return
-
-            # 3. 筛选嫌疑点
-            if self.gaussians_creation_frame_id is None: return
-            creation_ids = self.gaussians_creation_frame_id.squeeze()
-            ghost_counts = self.gaussians_ghost_count.squeeze()
-            
-            suspect_xyz = self.gaussians_xyz_grad
-
-            # 4. 投影关联
-            w2c = torch.inverse(cur_c2w)
-            R = w2c[:3, :3]; T = w2c[:3, 3]
-            pts_cam = (suspect_xyz @ R.T) + T
-            x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
-            
-            u = (x/z * self.fx + self.cx).long()
-            v = (y/z * self.fy + self.cy).long()
-            valid_uv = (z > 0.01) & (u >= 0) & (u < self.W) & (v >= 0) & (v < self.H)
-            
-            if valid_uv.any():
-                valid_indices_global = torch.where(valid_uv)[0]
-                u_valid, v_valid = u[valid_uv], v[valid_uv]
-                z_valid = z[valid_uv]
-                
-                # Z-Check
-                depth_at_pixel = depth_render[v_valid, u_valid]
-                is_contributor = (z_valid <= (depth_at_pixel + 0.05))
-                
-                is_pixel_guilty = pixel_guilty_mask[v_valid, u_valid]
-                is_pixel_innocent = pixel_innocent_mask[v_valid, u_valid]
-                
-                # 5. 更新计数
-                guilty_points = is_contributor & is_pixel_guilty
-                idx_to_penalize = valid_indices_global[guilty_points]
-                if len(idx_to_penalize) > 0:
-                    ghost_counts[idx_to_penalize] += 1
-                
-                innocent_points = is_contributor & is_pixel_innocent
-                idx_to_reward = valid_indices_global[innocent_points]
-                if len(idx_to_reward) > 0:
-                    ghost_counts[idx_to_reward] = torch.clamp(ghost_counts[idx_to_reward] - 1, min=0)
-
-                # 6. 分级处决 (Hierarchical Execution)
-                point_ages = current_frame_idx - creation_ids
-                prune_thresholds = torch.ones_like(ghost_counts) * 3 
-                prune_thresholds[point_ages > 30] = 10
-                prune_thresholds[point_ages > 100] = 50
-                
-                death_mask = (ghost_counts > prune_thresholds)
-                
-                # Debug Visualization
-                if death_mask.sum() > 0:
-                    try:
-                        prune_xyz = self.gaussians_xyz_grad[death_mask]
-                        pts_cam_p = (prune_xyz @ R.T) + T
-                        x_p, y_p, z_p = pts_cam_p[:, 0], pts_cam_p[:, 1], pts_cam_p[:, 2]
-                        valid_z_p = z_p > 0.01
-                        
-                        u_p = (x_p[valid_z_p] / z_p[valid_z_p] * self.fx + self.cx).long()
-                        v_p = (y_p[valid_z_p] / z_p[valid_z_p] * self.fy + self.cy).long()
-                        
-                        valid_draw = (u_p >= 0) & (u_p < self.W) & (v_p >= 0) & (v_p < self.H)
-                        u_draw = u_p[valid_draw].cpu().numpy()
-                        v_draw = v_p[valid_draw].cpu().numpy()
-                        
-                        viz_img = (gt_color.cpu().numpy() * 255).astype(np.uint8).copy()
-                        viz_img = cv2.cvtColor(viz_img, cv2.COLOR_RGB2BGR)
-                        viz_img[v_draw, u_draw] = [0, 0, 255] 
-                        
-                        save_name = f"{current_frame_idx:05d}_pruned_{death_mask.sum().item()}.png"
-                        save_path = os.path.join(self.debug_prune_dir, save_name)
-                        cv2.imwrite(save_path, viz_img)
-                    except Exception:
-                        pass
-
-                if death_mask.sum() > 0:
-                    self.prune_points(death_mask)
-    
 
     def optimize_map(self, num_joint_iters, idx, cur_gt_color, cur_gt_depth, gt_cur_c2w,
                      keyframe_dict, keyframe_list, cur_c2w, color_refine=False, cur_seg_mask = None):
@@ -1052,8 +992,12 @@ class gs_tracking_mapping():
         self.gaussians_opacity = self.gaussians.get_opacity()
         self.gaussians_scaling = self.gaussians.get_scaling()
         self.gaussians_rotation = self.gaussians.get_rotation()
-        self.gaussians_creation_frame_id = self.gaussians.get_creation_frame_id() # <--- [NEW]
-        self.gaussians_ghost_count = self.gaussians.get_ghost_count()  #[NEW]
+        # [NEW] 1. 获取 creation_frames
+        self.creation_frames = self.gaussians.creation_frames
+        # [NEW] 获取完整的 radii 用于备份
+        self.gaussians_radii = self.gaussians.max_radii2D
+        gaussians_radii_unfrustum = None # 初始化
+
         indices = None
         indices_unseen = None
         if self.frustum_feature_selection:  # required if not color_refine
@@ -1071,19 +1015,19 @@ class gs_tracking_mapping():
             gaussians_opacity_unfrustum = self.gaussians_opacity[indices_unseen].detach().clone()
             gaussians_scaling_unfrustum = self.gaussians_scaling[indices_unseen].detach().clone()
             gaussians_rotation_unfrustum = self.gaussians_rotation[indices_unseen].detach().clone()
-            # [NEW] Split unseen attributes
-            gaussians_creation_id_unfrustum = self.gaussians_creation_frame_id[indices_unseen].detach().clone()
-            gaussians_ghost_count_unfrustum = self.gaussians_ghost_count[indices_unseen].detach().clone()
+            # [NEW] 备份看不见部分的 creation_frames
+            creation_frames_unfrustum = self.creation_frames[indices_unseen].detach().clone()
+            # [NEW] 备份看不见部分的 radii
+            gaussians_radii_unfrustum = self.gaussians_radii[indices_unseen].detach().clone()
 
-            # [NEW] Keep seen attributes
-            self.gaussians_creation_frame_id = self.gaussians_creation_frame_id[indices].detach().clone()
-            self.gaussians_ghost_count = self.gaussians_ghost_count[indices].detach().clone()
             self.gaussians_xyz_grad = self.gaussians_xyz[indices].detach().clone().requires_grad_(True)
             self.gaussians_features_dc_grad = self.gaussians_features_dc[indices].detach().clone().requires_grad_(True)
             self.gaussians_features_rest_grad = self.gaussians_features_rest[indices].detach().clone().requires_grad_(True)
             self.gaussians_opacity_grad = self.gaussians_opacity[indices].detach().clone().requires_grad_(True)
             self.gaussians_scaling_grad = self.gaussians_scaling[indices].detach().clone().requires_grad_(True)
             self.gaussians_rotation_grad = self.gaussians_rotation[indices].detach().clone().requires_grad_(True)
+            # [NEW] 2. 准备用于当前优化的 creation_frames 副本 (frustum模式)
+            self.creation_frames_opt = self.creation_frames[indices].detach().clone()
             masked_c_grad['indices'] = indices
         else:
             masked_c_grad = {}
@@ -1093,7 +1037,8 @@ class gs_tracking_mapping():
             self.gaussians_opacity_grad = self.gaussians_opacity.detach().clone().requires_grad_(True)
             self.gaussians_scaling_grad = self.gaussians_scaling.detach().clone().requires_grad_(True)
             self.gaussians_rotation_grad = self.gaussians_rotation.detach().clone().requires_grad_(True)
-
+            # [NEW] 2. 准备用于当前优化的 creation_frames 副本 (全局模式)
+            self.creation_frames_opt = self.creation_frames.detach().clone()
         if self.encode_exposure:
             mlp_exposure_para_list += list(self.mlp_exposure.parameters())
 
@@ -1263,13 +1208,7 @@ class gs_tracking_mapping():
                 if joint_iter > 0 and joint_iter % 20 == 0:
                     self.prune_neural_point(0.001)
 
-                # [NEW] Call our new pruning logic
-                # 频率不用太高，每 50 次迭代检查一次
-                #if joint_iter > 0 and joint_iter % 50 == 0:
-                #   self.prune_dynamic_ghosting(cur_c2w, cur_gt_depth, cur_gt_color, cur_seg_mask, idx.item(), age_thres=10)
-                # 只在最后一次迭代运行，且只针对很老的点（age_thres=20）
-                if joint_iter == num_joint_iters - 1:
-                    self.prune_dynamic_ghosting(cur_c2w, cur_gt_depth, cur_gt_color, cur_seg_mask, idx.item(), age_thres=20)
+                
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 actual_joint_iters += 1
@@ -1303,6 +1242,8 @@ class gs_tracking_mapping():
                 self.gaussians_opacity[indices] = self.gaussians_opacity_grad.detach().clone()
                 self.gaussians_scaling[indices] = self.gaussians_scaling_grad.detach().clone()
                 self.gaussians_rotation[indices] = self.gaussians_rotation_grad.detach().clone()
+                # [NEW] 写回
+                self.creation_frames[indices] = self.creation_frames_opt.detach().clone()
             else:
                 self.gaussians_xyz = torch.cat((self.gaussians_xyz_grad.detach().clone(), gaussians_xyz_unfrustum.detach().clone()), 0)
                 self.gaussians_features_dc = torch.cat((self.gaussians_features_dc_grad.detach().clone(), gaussians_features_dc_unfrustum.detach().clone()), 0)
@@ -1310,9 +1251,8 @@ class gs_tracking_mapping():
                 self.gaussians_opacity = torch.cat((self.gaussians_opacity_grad.detach().clone(), gaussians_opacity_unfrustum.detach().clone()), 0)
                 self.gaussians_scaling = torch.cat((self.gaussians_scaling_grad.detach().clone(), gaussians_scaling_unfrustum.detach().clone()), 0)
                 self.gaussians_rotation = torch.cat((self.gaussians_rotation_grad.detach().clone(), gaussians_rotation_unfrustum.detach().clone()), 0)
-                # [NEW] Cat attributes
-                self.gaussians_creation_frame_id = torch.cat((self.gaussians_creation_frame_id, gaussians_creation_id_unfrustum), 0)
-                self.gaussians_ghost_count = torch.cat((self.gaussians_ghost_count, gaussians_ghost_count_unfrustum), 0)
+                # [NEW] 拼接写回
+                self.creation_frames = torch.cat((self.creation_frames_opt.detach().clone(), creation_frames_unfrustum.detach().clone()), 0)
                 masked_c_grad['indices'] = np.arange(self.gaussians_xyz_grad.shape[0]).tolist()
                 indices_unseen = np.arange(self.gaussians_xyz_grad.shape[0], self.gaussians_xyz_grad.shape[0] + gaussians_xyz_unfrustum.shape[0]).tolist()
         else:
@@ -1322,6 +1262,8 @@ class gs_tracking_mapping():
             self.gaussians_opacity = self.gaussians_opacity_grad.detach().clone()
             self.gaussians_scaling = self.gaussians_scaling_grad.detach().clone()
             self.gaussians_rotation = self.gaussians_rotation_grad.detach().clone()
+            # [NEW] 写回
+            self.creation_frames = self.creation_frames_opt.detach().clone()
 
         if self.frustum_feature_selection:
             self.gaussians.update_xyz(self.gaussians_xyz.detach().clone())
@@ -1330,9 +1272,21 @@ class gs_tracking_mapping():
             self.gaussians.update_scaling(self.gaussians_scaling.detach().clone())
             self.gaussians.update_rotation(self.gaussians_rotation.detach().clone())
             self.gaussians.update_opacity(self.gaussians_opacity.detach().clone())
-            # [NEW] Update model attributes
-            self.gaussians.update_creation_frame_id(self.gaussians_creation_frame_id.detach().clone())
-            self.gaussians.update_ghost_count(self.gaussians_ghost_count.detach().clone())
+            # [NEW] 同步 max_radii2D (Frustum模式)
+            # [FIXED] 像重组 XYZ 一样重组 Radii
+            # 本地 self.max_radii2D 是优化后(且可能剪枝后)的活跃部分
+            # gaussians_radii_unfrustum 是备份的不活跃部分
+            if self.max_radii2D is not None:
+                if len(indices_unseen) == 0:
+                     full_radii = self.max_radii2D.float().detach().clone()
+                else:
+                     full_radii = torch.cat((self.max_radii2D.float().detach().clone(), gaussians_radii_unfrustum.detach().clone()), 0)
+                
+                # 更新回模型
+                self.gaussians.update_max_radii2D(full_radii)
+
+            # [NEW] 更新 model creation_frames
+            self.gaussians.creation_frames = self.creation_frames.detach().clone()
         else:
             self.gaussians.update_xyz(self.gaussians_xyz.detach().clone())
             self.gaussians.update_features_dc(self.gaussians_features_dc.detach().clone())
@@ -1340,9 +1294,12 @@ class gs_tracking_mapping():
             self.gaussians.update_scaling(self.gaussians_scaling.detach().clone())
             self.gaussians.update_rotation(self.gaussians_rotation.detach().clone())
             self.gaussians.update_opacity(self.gaussians_opacity.detach().clone())
-            # [NEW] Update model attributes
-            self.gaussians.update_creation_frame_id(self.gaussians_creation_frame_id.detach().clone())
-            self.gaussians.update_ghost_count(self.gaussians_ghost_count.detach().clone())
+            # [NEW] 同步 max_radii2D (Global模式)
+            # [FIXED] Global 模式下 self.max_radii2D 就是全量的
+            if self.max_radii2D is not None:
+                self.gaussians.update_max_radii2D(self.max_radii2D.float().detach().clone())
+            # [NEW] 更新 model
+            self.gaussians.creation_frames = self.creation_frames.detach().clone()
         print('Mapper has updated point features.')
 
         if self.BA:
@@ -1598,6 +1555,9 @@ class gs_tracking_mapping():
             num_joint_iters = self.iters_first
 
         cur_c2w = self.estimate_c2w_list[idx].to(self.device)
+
+
+
         for outer_joint_iter in range(outer_joint_iters):
             self.BA = (len(self.keyframe_list) >
                         4) and self.cfg['mapping']['BA']
@@ -1607,6 +1567,41 @@ class gs_tracking_mapping():
             if self.BA:
                 cur_c2w = _
                 self.estimate_c2w_list[idx] = cur_c2w
+
+         
+# ... (mapping 函数末尾) ...
+
+        # ================= [Modified Cache Logic] =================
+        # [Step 1] 处理 Mask。
+        # 现状确认：run_tum 未改 -> Person=1, Bg=0 -> dg_model 取反 -> seg_mask: Bg=1, Person=0
+        # 目标：我们需要缓存 Person=1 的区域作为"杀戮区"
+        
+        # 1.1 取反，提取人 (Person=1, Bg=0)
+        person_mask_np = (~seg_mask.cpu().bool()).numpy().astype(np.uint8)
+        
+        # 1.2 膨胀 (建立 Kill Zone)
+        kernel = np.ones((5, 5), np.uint8) 
+        dilated_person_mask_np = cv2.dilate(person_mask_np, kernel, iterations=5) 
+        
+        # 1.3 存入缓存
+        dilated_person_mask_tensor = torch.from_numpy(dilated_person_mask_np).bool().to(self.device)
+        
+        cache_data = {
+            'mask': dilated_person_mask_tensor, # 1=Kill Zone (Person), 0=Safe
+            'depth': gt_depth,
+            'c2w': cur_c2w.clone(), 
+            'intrinsics': (self.fx, self.fy, self.cx, self.cy)
+        }
+        self.temporal_mask_cache[idx.item()] = cache_data
+        
+        # 维护缓存大小
+        if len(self.temporal_mask_cache) > self.max_cache_size:
+            oldest_key = min(self.temporal_mask_cache.keys())
+            del self.temporal_mask_cache[oldest_key]
+
+        # 执行剪枝
+        #self.perform_temporal_mask_pruning(current_frame_idx=idx.item(), check_window=5)
+        # ==========================================================
 
         if (idx % self.keyframe_every == 0 or (idx == self.n_img-2)) and (idx not in self.keyframe_list) and (not torch.isinf(gt_c2w).any()) and (not torch.isnan(gt_c2w).any()):
             self.keyframe_list.append(idx)
@@ -1619,49 +1614,42 @@ class gs_tracking_mapping():
                 dic_of_cur_frame.update(
                     {'exposure_feat': self.exposure_feat.detach()})
             self.keyframe_dict.append(dic_of_cur_frame)
-            # --- 新增代码：在此处进行渲染并保存 ---
-            with torch.no_grad():
-                # 准备渲染参数
-                camera_center = cur_c2w[:3, 3]
-                world_view_transform = torch.inverse(cur_c2w).transpose(0, 1)
-                
-                # 获取当前所有高斯的激活态参数
-                gaussians_opacity = self.opacity_activation(self.gaussians.get_opacity())
-                gaussians_scaling = self.scaling_activation(self.gaussians.get_scaling())
-                gaussians_rotation = self.rotation_activation(self.gaussians.get_rotation())
-                
-                # 调用渲染器
-                render_pkg = render(
-                    self.gaussians.get_xyz(), 
-                    self.gaussians.get_features_dc(), 
-                    self.gaussians.get_features_rest(),
-                    gaussians_opacity, 
-                    gaussians_scaling, 
-                    gaussians_rotation,
-                    self.gaussians.get_active_sh_degree(), 
-                    self.gaussians.get_max_sh_degree(),
-                    camera_center, 
-                    world_view_transform, 
-                    self.projection_matrix, 
-                    self.fovx, 
-                    self.fovy, 
-                    self.H, 
-                    self.W
-                )
-                
-                # 处理渲染出的图像
-                image_render = render_pkg["render"] # [3, H, W]
-                image_np = image_render.permute(1, 2, 0).cpu().numpy()
-                image_np = np.clip(image_np * 255, 0, 255).astype(np.uint8)
-                image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-                
-                # 确保保存路径存在并保存
-                render_save_dir = os.path.join(self.output, 'render_frames')
-                os.makedirs(render_save_dir, exist_ok=True)
-                save_path = os.path.join(render_save_dir, f'frame_{idx:05d}.png')
-                cv2.imwrite(save_path, image_bgr)
-                print(f'Saved rendering for keyframe {idx} to {save_path}')
-            # --- 新增代码结束 ---
+            # =========================================================
+            # 2. 【新增】关键帧渲染保存逻辑 
+            # =========================================================
+            try:
+                with torch.no_grad():
+                    # 准备渲染参数 (使用当前优化好的 Pose)
+                    camera_center = cur_c2w[:3, 3]
+                    world_view_transform = torch.inverse(cur_c2w).transpose(0, 1)
+                    
+                    # 执行一次额外的渲染 (开销极小)
+                    render_pkg = render(self.gaussians.get_xyz(), 
+                                        self.gaussians.get_features_dc(),
+                                        self.gaussians.get_features_rest(),
+                                        self.opacity_activation(self.gaussians.get_opacity()),
+                                        self.scaling_activation(self.gaussians.get_scaling()),
+                                        self.rotation_activation(self.gaussians.get_rotation()),
+                                        self.gaussians.get_active_sh_degree(),
+                                        self.gaussians.get_max_sh_degree(),
+                                        camera_center, world_view_transform,
+                                        self.projection_matrix, self.fovx, self.fovy, self.H, self.W)
+                    
+                    # 获取图片并转换格式
+                    image = render_pkg["render"] # (3, H, W)
+                    vis_img = image.permute(1, 2, 0).detach().cpu().numpy() # (H, W, 3)
+                    vis_img = (np.clip(vis_img, 0, 1) * 255).astype(np.uint8)
+                    vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR) # RGB -> BGR
+                    
+                    # 保存到 renders 文件夹
+                    render_dir = os.path.join(self.output, "renders")
+                    os.makedirs(render_dir, exist_ok=True)
+                    # 使用 idx 作为文件名
+                    cv2.imwrite(os.path.join(render_dir, f"keyframe_{int(idx.item()):05d}.jpg"), vis_img)
+                    print(f"Saved keyframe render: {int(idx.item())}")
+            except Exception as e:
+                print(f"Warning: Failed to save render for frame {idx}: {e}")
+            # =========================================================
         
         self.pre_c2w = self.estimate_c2w_list[idx].to(self.device)
 
