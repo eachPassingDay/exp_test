@@ -403,11 +403,12 @@ class gs_tracking_mapping():
         # 1. 自适应增点 (Adaptive Densification)
         # ==============================================================================================
         if idx == 0:
-            add_pts_num = torch.clamp(self.pixels_adding * ((gt_depth.median() / 2.5) ** 2),
-                                      min=self.pixels_adding, max=self.pixels_adding * 3).int().item() * 2
+            # [修改] 去掉平方项，改为线性或恒定，防止远景初始化过多噪点
+            # 设定一个温和的深度系数，例如最多 1.5 倍
+            depth_factor = torch.clamp(gt_depth.median() / 2.5, min=1.0, max=1.5).item()
+            add_pts_num = int(self.pixels_adding * depth_factor * 4) 
         else:
             add_pts_num = max(self.pixels_adding // 5, 600)
-
         # 修正: Mask 直接使用传入的 seg_mask (1=Static)
         refined_mask = seg_mask
 
@@ -472,12 +473,14 @@ class gs_tracking_mapping():
             # 2. 梯度采样 + 静态遮罩门禁
             # ======================================================================================
             if self.pixels_based_on_color_grad > 0:
+                # [修改] 显式传入 seg_mask=refined_mask，让采样在源头就避开动态物体
                 batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples_with_pixel_grad(
                     0, H, 0, W, self.pixels_based_on_color_grad,
                     H, W, fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device,
-                    depth_filter=True, return_index=True)
+                    depth_filter=True, return_index=True, 
+                    seg_mask=refined_mask) # <--- 插入这一行参数
                 
-                # 边界安全检查 + Mask 过滤
+                # 边界安全检查 + Mask 过滤 (这部分可以保留作为双重保险，或者应对索引越界)
                 if refined_mask is not None:
                     MH, MW = refined_mask.shape
                     valid_mask_indices = (i >= 0) & (i < MH) & (j >= 0) & (j < MW)
@@ -506,7 +509,81 @@ class gs_tracking_mapping():
                         current_frame_id=idx.item()
                     )
                     frame_pts_add += _  # Accumulate
+                    
+            # ================= [模块一验证：精准空投采样] =================
+            # 仅在第一帧或关键帧间隔时触发，避免太重
+            if idx == 0 or idx % 5 == 0:
+                # 1. 定义黑洞
+                # [修正尝试 1] 增加对 NaN 的兼容
+                invalid_depth = (gt_depth <= 0) | torch.isnan(gt_depth)
+                
+                # [诊断打印] 放在这里！看看到底有多少个无效深度，多少个 Mask
+                hole_mask_raw = invalid_depth
+                hole_mask_final = invalid_depth & refined_mask
+                
+                print(f"[DEBUG] Frame {idx}: Invalid Depth Px: {hole_mask_raw.sum().item()}, Refined Mask Valid Px: {refined_mask.sum().item()}, Intersection (Candidates): {hole_mask_final.sum().item()}")
 
+                # 使用修正后的逻辑
+                hole_candidates = torch.nonzero(hole_mask_final)
+                num_candidates = hole_candidates.shape[0]
+                
+                # 设定我们想填补的点数
+                target_fill_num = 5000 if idx == 0 else 1000
+                
+                if num_candidates > 0:
+                    # 3. 从候选坐标中随机抽取 target_fill_num 个
+                    # 如果候选点不够，就全取；够的话就随机采
+                    select_num = min(target_fill_num, num_candidates)
+                    
+                    # 使用 torch.randperm 生成随机索引
+                    rand_indices = torch.randperm(num_candidates)[:select_num]
+                    selected_coords = hole_candidates[rand_indices] # (v, u)
+                    
+                    v_sel = selected_coords[:, 0]
+                    u_sel = selected_coords[:, 1]
+                    
+                    # 4. 准备数据
+                    # 颜色：直接从原图读
+                    color_fill = gt_color[v_sel, u_sel]
+                    
+                    # 深度：【暂时先用固定值验证采样效率】
+                    # 下一步我们再换成动态深度，现在先由简入繁
+                    depth_fill = torch.ones_like(v_sel).float() * 6.0 
+                    
+                    # 反投影获取射线原点和方向 (利用现有的 helper 函数或直接算)
+                    # 这里我们利用 fast path: 既然有 u, v 和 depth，直接反投影
+                    # x = (u - cx) * Z / fx
+                    # y = (v - cy) * Z / fy
+                    # z = Z
+                    x_fill = (u_sel - cx) * depth_fill / fx
+                    y_fill = (v_sel - cy) * depth_fill / fy
+                    z_fill = depth_fill
+                    
+                    # 转到世界坐标系 (Camera -> World)
+                    # pts_c: [N, 3]
+                    pts_c = torch.stack([x_fill, y_fill, z_fill], dim=-1)
+                    # Apply c2w rotation and translation
+                    # pts_w = pts_c @ R.T + t
+                    pts_w = (pts_c @ cur_c2w[:3, :3].T) + cur_c2w[:3, 3]
+                    
+                    # 计算射线方向 rays_d = (pts_w - camera_center) / norm
+                    camera_center = cur_c2w[:3, 3]
+                    rays_d_fill = pts_w - camera_center
+                    rays_d_fill = rays_d_fill / (torch.norm(rays_d_fill, dim=-1, keepdim=True) + 1e-7)
+                    rays_o_fill = camera_center.expand_as(rays_d_fill)
+
+                    # 5. 添加点
+                    self.gaussian_model.add_neural_points(
+                        rays_o_fill, 
+                        rays_d_fill, 
+                        depth_fill, 
+                        color_fill,
+                        current_frame_idx=current_frame_idx
+                    )
+                    
+                    # 【验证打印】看看到底加了多少个点
+                    print(f"[Module 1] Frame {idx}: Hole size {num_candidates} px. Added {select_num} points to holes.")
+            # ==========================================================
             if self.pixels_based_on_render and idx > 0:
                 with torch.no_grad():
                     camera_center = cur_c2w[:3, 3]
@@ -574,6 +651,42 @@ class gs_tracking_mapping():
                                                          current_frame_id=idx.item())
                     frame_pts_add += _  # Accumulate
 
+        # ================= [可视化验证模块：Mask 诊断] =================
+        # 仅在第一帧或关键帧运行，保存 Mask 用于检查
+        if idx == 0 or idx % 10 == 0:
+            
+            # 1. 准备基础数据
+            # 这里的 refined_mask 是你当前代码用于过滤采样和Loss的那个 Mask
+            mask_vis = refined_mask.cpu().numpy().astype(np.uint8) * 255
+            
+            # 2. 准备深度辅助图 (查看哪些地方被忽略了)
+            # 定义"被遗弃的远景": Mask 为 False (被剔除) 且 深度 > 3.5m
+            neglected_far_mask = (~refined_mask) & (gt_depth > 3.5)
+            neglected_vis = neglected_far_mask.cpu().numpy().astype(np.uint8) * 255
+            
+            # 3. 准备 RGB 对照图
+            img_vis = (gt_color.cpu().numpy() * 255).astype(np.uint8)
+            img_vis = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
+            
+            # 4. 叠加显示 (将"拟填补区域"标红显示在 RGB 图上)
+            # 红色 = 我们打算强行采样的区域 (Neglected Far)
+            # 绿色 = 现有的静态 Mask (Refined Mask)
+            overlay = img_vis.copy()
+            # BGR 格式
+            overlay[mask_vis > 0] = overlay[mask_vis > 0] * 0.5 + np.array([0, 255, 0]) * 0.5 # 绿色覆盖现有Mask
+            overlay[neglected_vis > 0] = [0, 0, 255] # 纯红色标记"拟填补区域"
+            
+            # 5. 保存
+            save_dir = os.path.join(self.output, 'debug_mask_check')
+            os.makedirs(save_dir, exist_ok=True)
+            
+            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_0_rgb.png'), img_vis)
+            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_1_refined_mask.png'), mask_vis)
+            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_2_proposed_fill.png'), neglected_vis) # 这张图里应该是墙壁，不含人
+            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_3_overlay.png'), overlay)
+            
+            print(f"[Viz Check] Frame {idx}: Saved mask debug images to {save_dir}")
+        # ==========================================================
         # ==============================================================================================
         # 3. 准备数据 (Seen/Unseen)
         # ==============================================================================================
@@ -688,7 +801,13 @@ class gs_tracking_mapping():
             depths_wmask = depth[mask]
             gt_depths_wmask = gt_depth[mask]
 
-            geo_loss = torch.abs(gt_depths_wmask - depths_wmask).sum()
+            # [修改] 引入距离权重衰减 (Depth Confidence Decay)
+            # 远于 4m 的点，几何权重降为 0.1；近处保持 1.0
+            dist_weights = torch.ones_like(gt_depths_wmask)
+            dist_weights[gt_depths_wmask > 4.0] = 0.1 
+            
+            # 应用权重
+            geo_loss = (torch.abs(gt_depths_wmask - depths_wmask) * dist_weights).sum()
             loss = geo_loss.clone() * self.w_geo_loss
             color_mask = mask
             color_loss = torch.abs(gt_color[color_mask] - image[color_mask]).sum()
@@ -932,12 +1051,34 @@ class gs_tracking_mapping():
                 is_pixel_guilty = pixel_guilty_mask[v_valid, u_valid]
                 is_pixel_innocent = pixel_innocent_mask[v_valid, u_valid]
                 
-                # 5. 更新计数
-                guilty_points = is_contributor & is_pixel_guilty
-                idx_to_penalize = valid_indices_global[guilty_points]
-                if len(idx_to_penalize) > 0:
-                    ghost_counts[idx_to_penalize] += 1
+
+                # =================== Step 5: 更新计数 (修正版) ===================
                 
+                # 1. 定义全图的重罪 mask (这是 HxW 的图)
+                is_heavy_crime_map = (depth_diff > 0.20)
+                
+                # [关键修正]：必须从图中取出对应像素点的值，使其变成 (N,) 的向量
+                # 这样它才能和 is_pixel_guilty (N,) 进行运算
+                is_heavy_crime = is_heavy_crime_map[v_valid, u_valid]
+                
+                # 2. 重罪点 (Heavy Guilty)
+                mask_heavy = is_pixel_guilty & is_heavy_crime
+                heavy_points = is_contributor & mask_heavy
+                idx_heavy = valid_indices_global[heavy_points]
+                
+                if len(idx_heavy) > 0:
+                    ghost_counts[idx_heavy] += 10 # 严厉惩罚
+                
+                # 3. 轻罪点 (Light Guilty)
+                # 同样，这里的运算现在都是 (N,) 对 (N,) 了，是合法的
+                mask_light = is_pixel_guilty & (~is_heavy_crime)
+                light_points = is_contributor & mask_light
+                idx_light = valid_indices_global[light_points]
+                
+                if len(idx_light) > 0:
+                    ghost_counts[idx_light] += 1 # 标准惩罚
+
+                # 4. 奖励逻辑 (保持不变)
                 innocent_points = is_contributor & is_pixel_innocent
                 idx_to_reward = valid_indices_global[innocent_points]
                 if len(idx_to_reward) > 0:
@@ -1242,7 +1383,15 @@ class gs_tracking_mapping():
             depths_wmask = depths[mask]
             gt_depths_wmask = gt_depths[mask]
 
-            geo_loss = torch.abs(gt_depths_wmask-depths_wmask).sum()
+            # [新增修改] 同样应用距离权重衰减
+            # 这里的 gt_depths_wmask 包含了所有选定帧的所有有效像素深度
+            # 逻辑和 optimize_cur_map 一样：远于 4m 的给低权重
+            dist_weights = torch.ones_like(gt_depths_wmask)
+            dist_weights[gt_depths_wmask > 4.0] = 0.1 
+            
+            # 应用权重计算 Loss
+            geo_loss = (torch.abs(gt_depths_wmask - depths_wmask) * dist_weights).sum()
+            
             loss = geo_loss.clone() * self.w_geo_loss
             color_mask = mask
             color_loss = torch.abs(gt_colors[color_mask] - images[color_mask]).sum()
@@ -1268,8 +1417,8 @@ class gs_tracking_mapping():
                 #if joint_iter > 0 and joint_iter % 50 == 0:
                 #   self.prune_dynamic_ghosting(cur_c2w, cur_gt_depth, cur_gt_color, cur_seg_mask, idx.item(), age_thres=10)
                 # 只在最后一次迭代运行，且只针对很老的点（age_thres=20）
-                if joint_iter == num_joint_iters - 1:
-                    self.prune_dynamic_ghosting(cur_c2w, cur_gt_depth, cur_gt_color, cur_seg_mask, idx.item(), age_thres=20)
+                #if joint_iter == num_joint_iters - 1:
+                    #self.prune_dynamic_ghosting(cur_c2w, cur_gt_depth, cur_gt_color, cur_seg_mask, idx.item(), age_thres=20)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 actual_joint_iters += 1

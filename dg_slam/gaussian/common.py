@@ -91,8 +91,7 @@ def get_sample_uv(H0, H1, W0, W1, n, depth, color, seg_mask, device='cuda:0'):
     i, j, depth, color, seg_mask = select_uv(i, j, n, depth, color, seg_mask, device=device)
     return i, j, depth, color, seg_mask
 
-
-def get_sample_uv_with_grad(H0, H1, W0, W1, n, image):
+def get_sample_uv_with_grad(H0, H1, W0, W1, n, image, seg_mask=None): # [修改] 增加默认参数
     """
     Sample n uv coordinates from an image region H0..H1, W0..W1
     image (numpy.ndarray): color image or estimated normal image
@@ -103,7 +102,15 @@ def get_sample_uv_with_grad(H0, H1, W0, W1, n, image):
     grad_x = filters.sobel_v(intensity)
     grad_mag = np.sqrt(grad_x**2 + grad_y**2)
 
+    # [新增] 如果提供了 Mask，将非静态区域的梯度归零，防止选中动态物体
+    if seg_mask is not None:
+        mask_np = seg_mask.cpu().numpy()
+        # 确保 mask 维度匹配，通常 seg_mask 是 (H, W)
+        # 如果是 True/1 (静态), 梯度保留; False/0 (动态), 梯度变0
+        grad_mag = grad_mag * mask_np
+
     img_size = (image.shape[0], image.shape[1])
+    # 下面的逻辑不变，现在选出的 top n 肯定避开了动态物体
     selected_index = np.argpartition(grad_mag, -5*n, axis=None)[-5*n:]
     indices_h, indices_w = np.unravel_index(selected_index, img_size)
     mask = (indices_h >= H0) & (indices_h < H1) & (
@@ -237,23 +244,21 @@ def get_samples(H0, H1, W0, W1, n, fx, fy, cx, cy, c2w, depth, color, device,
         return rays_o, rays_d, sample_depth, sample_color, i.to(torch.int64), j.to(torch.int64)
     return rays_o, rays_d, sample_depth, sample_color
 
-
 def get_samples_with_pixel_grad(H0, H1, W0, W1, n_color, H, W, fx, fy, cx, cy, c2w, depth, color, device,
-                                depth_filter=True, return_index=True, depth_limit=None):
+                                depth_filter=True, return_index=True, depth_limit=None, seg_mask=None): # [修改] 增加默认参数
     """
     Get n rays from the image region H0..H1, W0..W1 based on color gradients, normal map gradients and random selection
     H, W: height, width.
-    fx, fy, cx, cy: intrinsics.
-    c2w is its camera pose and depth/color is the corresponding image tensor.
-
+    ...
     """
 
     assert (n_color > 0), 'invalid number of rays to sample.'
 
     index_color_grad, index_normal_grad = [], []
     if n_color > 0:
+        # [修改] 将 seg_mask 传递给底层函数
         index_color_grad = get_sample_uv_with_grad(
-            H0, H1, W0, W1, n_color, color)
+            H0, H1, W0, W1, n_color, color, seg_mask=seg_mask)
 
     merged_indices = np.union1d(index_color_grad, index_normal_grad)
 
