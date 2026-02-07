@@ -62,6 +62,9 @@ class gs_tracking_mapping():
         self.gt_c2w_list = torch.zeros((self.n_img, 4, 4))
         self.idx = torch.zeros((1)).int()
         self.mapping_idx = torch.zeros((1)).int()
+        # 在 __init__ 中添加
+        self.last_dynamic_ratio = 0.0
+        self.last_keyframe_idx = -1
 
         self.wandb = cfg['wandb']
         self.project_name = cfg['project_name']
@@ -510,80 +513,135 @@ class gs_tracking_mapping():
                     )
                     frame_pts_add += _  # Accumulate
                     
-            # ================= [模块一验证：精准空投采样] =================
-            # 仅在第一帧或关键帧间隔时触发，避免太重
-            if idx == 0 or idx % 5 == 0:
-                # 1. 定义黑洞
-                # [修正尝试 1] 增加对 NaN 的兼容
-                invalid_depth = (gt_depth <= 0) | torch.isnan(gt_depth)
-                
-                # [诊断打印] 放在这里！看看到底有多少个无效深度，多少个 Mask
-                hole_mask_raw = invalid_depth
-                hole_mask_final = invalid_depth & refined_mask
-                
-                print(f"[DEBUG] Frame {idx}: Invalid Depth Px: {hole_mask_raw.sum().item()}, Refined Mask Valid Px: {refined_mask.sum().item()}, Intersection (Candidates): {hole_mask_final.sum().item()}")
+            # ======================================================================================
+            # [Module 1]: 基于几何密度的反向填补 (Inverse Density Filling)
+            # 插入位置：在 optimize_cur_map 的 for 循环之前
+            # 目的：先补点，再让后续的循环优化它们
+            # ======================================================================================
+            
+            # 频率修正：idx是关键帧ID，且Mapping机会难得，每次都跑 (if True)
+            if True: 
+                with torch.no_grad():
+                    # 0. 变量名统一 (确保使用传入的 seg_mask)
+                    # 如果你的函数参数名是 seg_mask，这里做一个别名，方便后面逻辑复用
+                    refined_mask = seg_mask 
 
-                # 使用修正后的逻辑
-                hole_candidates = torch.nonzero(hole_mask_final)
-                num_candidates = hole_candidates.shape[0]
-                
-                # 设定我们想填补的点数
-                target_fill_num = 5000 if idx == 0 else 1000
-                
-                if num_candidates > 0:
-                    # 3. 从候选坐标中随机抽取 target_fill_num 个
-                    # 如果候选点不够，就全取；够的话就随机采
-                    select_num = min(target_fill_num, num_candidates)
-                    
-                    # 使用 torch.randperm 生成随机索引
-                    rand_indices = torch.randperm(num_candidates)[:select_num]
-                    selected_coords = hole_candidates[rand_indices] # (v, u)
-                    
-                    v_sel = selected_coords[:, 0]
-                    u_sel = selected_coords[:, 1]
-                    
-                    # 4. 准备数据
-                    # 颜色：直接从原图读
-                    color_fill = gt_color[v_sel, u_sel]
-                    
-                    # 深度：【暂时先用固定值验证采样效率】
-                    # 下一步我们再换成动态深度，现在先由简入繁
-                    depth_fill = torch.ones_like(v_sel).float() * 6.0 
-                    
-                    # 反投影获取射线原点和方向 (利用现有的 helper 函数或直接算)
-                    # 这里我们利用 fast path: 既然有 u, v 和 depth，直接反投影
-                    # x = (u - cx) * Z / fx
-                    # y = (v - cy) * Z / fy
-                    # z = Z
-                    x_fill = (u_sel - cx) * depth_fill / fx
-                    y_fill = (v_sel - cy) * depth_fill / fy
-                    z_fill = depth_fill
-                    
-                    # 转到世界坐标系 (Camera -> World)
-                    # pts_c: [N, 3]
-                    pts_c = torch.stack([x_fill, y_fill, z_fill], dim=-1)
-                    # Apply c2w rotation and translation
-                    # pts_w = pts_c @ R.T + t
-                    pts_w = (pts_c @ cur_c2w[:3, :3].T) + cur_c2w[:3, 3]
-                    
-                    # 计算射线方向 rays_d = (pts_w - camera_center) / norm
-                    camera_center = cur_c2w[:3, 3]
-                    rays_d_fill = pts_w - camera_center
-                    rays_d_fill = rays_d_fill / (torch.norm(rays_d_fill, dim=-1, keepdim=True) + 1e-7)
-                    rays_o_fill = camera_center.expand_as(rays_d_fill)
-
-                    # 5. 添加点
-                    self.gaussian_model.add_neural_points(
-                        rays_o_fill, 
-                        rays_d_fill, 
-                        depth_fill, 
-                        color_fill,
-                        current_frame_idx=current_frame_idx
+                    # 1. 获取几何投影信息 (复用现有的渲染器)
+                    # viewspace_points: [N, 2] 高斯中心在屏幕空间的坐标
+                    render_pkg = render(
+                        self.gaussians.get_xyz(), 
+                        self.gaussians.get_features_dc(), 
+                        self.gaussians.get_features_rest(),
+                        self.opacity_activation(self.gaussians.get_opacity()), 
+                        self.scaling_activation(self.gaussians.get_scaling()), 
+                        self.rotation_activation(self.gaussians.get_rotation()),
+                        self.gaussians.get_active_sh_degree(), 
+                        self.gaussians.get_max_sh_degree(),
+                        cur_c2w[:3, 3], 
+                        torch.inverse(cur_c2w).transpose(0, 1), 
+                        self.projection_matrix, 
+                        self.fovx, self.fovy, self.H, self.W
                     )
                     
-                    # 【验证打印】看看到底加了多少个点
-                    print(f"[Module 1] Frame {idx}: Hole size {num_candidates} px. Added {select_num} points to holes.")
-            # ==========================================================
+                    # 2. 计算几何密度图 (Density Map)
+                    viewspace_pts = render_pkg["viewspace_points"]
+                    visible_mask = render_pkg["visibility_filter"]
+                    valid_pts = viewspace_pts[visible_mask]
+                    
+                    # 映射坐标 [-1, 1] -> [0, W]
+                    # 注意：假设 render 返回的是 NDC 归一化坐标。如果是像素坐标，需去除这一步
+                    # 这里保留归一化转像素的逻辑，这是最通用的
+                    pts_x = (valid_pts[:, 0] / 2.0 + 0.5) * self.W 
+                    pts_y = (valid_pts[:, 1] / 2.0 + 0.5) * self.H
+                    
+                    pts_x = pts_x.long().clamp(0, self.W - 1)
+                    pts_y = pts_y.long().clamp(0, self.H - 1)
+                    
+                    # 使用 scatter_add 快速计数
+                    density_map = torch.zeros((self.H, self.W), device=self.device, dtype=torch.float32)
+                    flat_indices = pts_y * self.W + pts_x
+                    ones = torch.ones_like(flat_indices, dtype=torch.float32)
+                    density_map.view(-1).scatter_add_(0, flat_indices, ones)
+                    
+                    # 3. 构建目标遮罩 (Target Mask)
+                    
+                    # 3.1 腐蚀 Mask (物理切除人头边缘飞点)
+                    mask_np = refined_mask.cpu().numpy().astype(np.uint8)
+                    kernel = np.ones((5, 5), np.uint8) 
+                    mask_eroded = cv2.erode(mask_np, kernel, iterations=1)
+                    safe_static_mask = torch.from_numpy(mask_eroded).bool().to(self.device)
+                    
+                    # 3.2 计算梯度 (用于区分墙壁和杂物)
+                    # 转灰度
+                    gray = 0.299 * gt_color[:,:,0] + 0.587 * gt_color[:,:,1] + 0.114 * gt_color[:,:,2]
+                    
+                    # 简单的 Sobel 梯度计算
+                    sobel_x = torch.abs(gray[:, 1:] - gray[:, :-1])
+                    sobel_y = torch.abs(gray[1:, :] - gray[:-1, :])
+                    
+                    grad_mag = torch.zeros_like(gray)
+                    grad_mag[:, 1:] += sobel_x
+                    grad_mag[1:, :] += sobel_y
+                    
+                    # 平坦区域判定 (墙壁梯度通常极低)
+                    is_flat = grad_mag < 0.05 
+                    
+                    # 3.3 组合条件
+                    # (安全静态) & (完全没点) & (平坦区域)
+                    target_mask = safe_static_mask & (density_map < 1) & is_flat
+                    
+                    # 额外保护：深度 > 0.5m (防止贴脸遮挡)
+                    if gt_depth is not None:
+                        target_mask = target_mask & (gt_depth > 0.5)
+
+                    num_fill = target_mask.sum().item()
+
+                    if num_fill > 0:
+                        # 4. 执行填补
+                        fill_budget = 3000 # 每次最多补3000点
+                        candidates = torch.nonzero(target_mask)
+                        
+                        if candidates.shape[0] > fill_budget:
+                            indices = torch.randperm(candidates.shape[0])[:fill_budget]
+                            selected_coords = candidates[indices]
+                        else:
+                            selected_coords = candidates
+                        
+                        v_sel = selected_coords[:, 0]
+                        u_sel = selected_coords[:, 1]
+                        
+                        # 准备数据
+                        depth_new = gt_depth[v_sel, u_sel]
+                        color_new = gt_color[v_sel, u_sel]
+                        
+                        # 反投影 (2D -> 3D)
+                        x_new = (u_sel - cx) * depth_new / fx
+                        y_new = (v_sel - cy) * depth_new / fy
+                        z_new = depth_new
+                        
+                        pts_c = torch.stack([x_new, y_new, z_new], dim=-1)
+                        # 转世界坐标
+                        pts_w = (pts_c @ cur_c2w[:3, :3].T) + cur_c2w[:3, 3]
+                        
+                        # 计算方向向量
+                        cam_center = cur_c2w[:3, 3]
+                        rays_d = pts_w - cam_center
+                        rays_d = rays_d / (torch.norm(rays_d, dim=-1, keepdim=True) + 1e-7)
+                        rays_o = cam_center.expand_as(rays_d)
+                        
+                        # [关键修正] 使用正确的成员变量名 self.gaussians
+                        self.gaussians.add_neural_points(
+                            rays_o, rays_d, depth_new, color_new,
+                            current_frame_id =idx.item()
+                        )
+                        
+                        print(f"[Density Fill] Keyframe {idx}: Hole size {num_fill} px. Injected {selected_coords.shape[0]} points.")
+
+            # ==================== [Module 1 End] ====================
+
+        # 原有的优化循环 (不要动它)
+        for i in range(num_joint_iters):
+             # ... existing optimization code ...
             if self.pixels_based_on_render and idx > 0:
                 with torch.no_grad():
                     camera_center = cur_c2w[:3, 3]
@@ -650,44 +708,87 @@ class gs_tracking_mapping():
                                                          dynamic_radius=self.dynamic_r_add[j, i] if self.use_dynamic_radius else None,
                                                          current_frame_id=idx.item())
                     frame_pts_add += _  # Accumulate
+        # ================= [深度分析模块 V5 (Final Diagnostic)] =================
+        # 修正目标：解决"全图只有一类"的问题。
+        # 方法：在聚类前剔除 > 8.0m 的异常值 (Skybox)，强迫 K-Means 关注室内细节。
+        
+        if True: # 每次关键帧都保存分析图
+            from sklearn.cluster import KMeans
 
-        # ================= [可视化验证模块：Mask 诊断] =================
-        # 仅在第一帧或关键帧运行，保存 Mask 用于检查
-        if idx == 0 or idx % 10 == 0:
+            # 1. 准备数据
+            depth_np = gt_depth.cpu().numpy()
+            H, W = depth_np.shape
             
-            # 1. 准备基础数据
-            # 这里的 refined_mask 是你当前代码用于过滤采样和Loss的那个 Mask
-            mask_vis = refined_mask.cpu().numpy().astype(np.uint8) * 255
+            # 2. 深度可视化 (热力图)
+            # 归一化显示 (0 ~ 6m)，超过6m的都显示为最红
+            viz_depth_clipped = np.clip(depth_np, 0, 6.0) 
+            norm_depth = cv2.normalize(viz_depth_clipped, None, 0, 255, cv2.NORM_MINMAX)
+            depth_heatmap = cv2.applyColorMap(norm_depth.astype(np.uint8), cv2.COLORMAP_JET)
             
-            # 2. 准备深度辅助图 (查看哪些地方被忽略了)
-            # 定义"被遗弃的远景": Mask 为 False (被剔除) 且 深度 > 3.5m
-            neglected_far_mask = (~refined_mask) & (gt_depth > 3.5)
-            neglected_vis = neglected_far_mask.cpu().numpy().astype(np.uint8) * 255
+            # 3. K-Means 聚类数据清洗 (关键步骤!)
+            # 只取 0.1m ~ 8.0m 之间的数据参与聚类训练
+            # 这样 10000m 的巨人就不会破坏室内的分类了
+            valid_mask = (depth_np > 0.1) & (depth_np < 8.0)
+            train_data = depth_np[valid_mask]
             
-            # 3. 准备 RGB 对照图
-            img_vis = (gt_color.cpu().numpy() * 255).astype(np.uint8)
-            img_vis = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
+            n_clusters = 3 # 设定3类: 近景、中景、远景
             
-            # 4. 叠加显示 (将"拟填补区域"标红显示在 RGB 图上)
-            # 红色 = 我们打算强行采样的区域 (Neglected Far)
-            # 绿色 = 现有的静态 Mask (Refined Mask)
-            overlay = img_vis.copy()
-            # BGR 格式
-            overlay[mask_vis > 0] = overlay[mask_vis > 0] * 0.5 + np.array([0, 255, 0]) * 0.5 # 绿色覆盖现有Mask
-            overlay[neglected_vis > 0] = [0, 0, 255] # 纯红色标记"拟填补区域"
+            # 初始化标签图 (默认为 n_clusters，即第4类"异常/极远")
+            labels_img = np.full((H, W), n_clusters, dtype=int)
             
-            # 5. 保存
-            save_dir = os.path.join(self.output, 'debug_mask_check')
-            os.makedirs(save_dir, exist_ok=True)
-            
-            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_0_rgb.png'), img_vis)
-            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_1_refined_mask.png'), mask_vis)
-            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_2_proposed_fill.png'), neglected_vis) # 这张图里应该是墙壁，不含人
-            cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_3_overlay.png'), overlay)
-            
-            print(f"[Viz Check] Frame {idx}: Saved mask debug images to {save_dir}")
+            if train_data.size > 0:
+                # reshape 修复之前的报错
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
+                kmeans.fit(train_data.reshape(-1, 1))
+                
+                # 预测有效区域
+                labels_img[valid_mask] = kmeans.predict(depth_np[valid_mask].reshape(-1, 1))
+                
+                # 4. 统计与可视化
+                centers = kmeans.cluster_centers_.flatten()
+                sorted_indices = np.argsort(centers) # 按深度排序：近->远
+                
+                # 颜色定义: [Blue(近), Green(中), Yellow(远), Red(异常/极远)]
+                colors = [
+                    [255, 0, 0],   # Rank 1: Blue
+                    [0, 255, 0],   # Rank 2: Green
+                    [0, 255, 255], # Rank 3: Yellow (这通常是我们要补的墙)
+                    [0, 0, 255],   # Rank 4: Red (Droid认为是无穷远的地方)
+                ]
+                
+                cluster_vis = np.zeros((H, W, 3), dtype=np.uint8)
+                
+                print(f"\n--- [Depth Cluster Analysis] Keyframe {idx} ---")
+                print(f"{'Rank':<5} | {'Range (Median)':<20} | {'Count':<10} | {'Desc'}")
+                
+                # 绘制前3类 (室内)
+                for i, cluster_idx in enumerate(sorted_indices):
+                    mask_cluster = (labels_img == cluster_idx)
+                    if np.sum(mask_cluster) > 0:
+                        vals = depth_np[mask_cluster]
+                        cluster_vis[mask_cluster] = colors[i]
+                        print(f"{i+1:<5} | {np.median(vals):.2f}m               | {np.sum(mask_cluster):<10} | Indoor Layer {i+1}")
+
+                # 绘制第4类 (异常值)
+                mask_outlier = (labels_img == n_clusters)
+                if np.sum(mask_outlier) > 0:
+                    vals = depth_np[mask_outlier]
+                    cluster_vis[mask_outlier] = colors[3]
+                    print(f"Out   | {np.median(vals):.2f}m (Max {np.max(vals):.0f}) | {np.sum(mask_outlier):<10} | Outliers (>8m)")
+
+                # 5. 保存结果
+                save_dir = os.path.join(self.output, 'debug_depth_clusters_fixed')
+                os.makedirs(save_dir, exist_ok=True)
+                
+                # 叠加原图方便观察
+                img_vis = (gt_color.cpu().numpy() * 255).astype(np.uint8)
+                img_vis = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
+                overlay = cv2.addWeighted(img_vis, 0.6, cluster_vis, 0.4, 0)
+                
+                cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_3_overlay.png'), overlay)
+        # =========================================================================
+        
         # ==========================================================
-        # ==============================================================================================
         # 3. 准备数据 (Seen/Unseen)
         # ==============================================================================================
         self.gaussians_xyz = self.gaussians.get_xyz()
@@ -849,6 +950,8 @@ class gs_tracking_mapping():
                     wandb.log({'idx_map': int(idx.item()),
                                'num_joint_iters': num_joint_iters})
 
+
+
         self.gaussians_xyz = torch.cat((self.gaussians_xyz_grad.detach().clone(), gaussians_xyz_unfrustum.detach().clone()), 0)
         self.gaussians_features_dc = torch.cat((self.gaussians_features_dc_grad.detach().clone(), gaussians_features_dc_unfrustum.detach().clone()), 0)
         self.gaussians_features_rest = torch.cat((self.gaussians_features_rest_grad.detach().clone(), gaussians_features_rest_unfrustum.detach().clone()), 0)
@@ -870,103 +973,118 @@ class gs_tracking_mapping():
         self.gaussians.update_ghost_count(self.gaussians_ghost_count.detach().clone())
         
         print('Current Map has been updated (Pruning Active)')
-        # [新增可视化实验 1] 验证"糊"：可视化高斯点在当前视角的分布
-        # ---------------------------------------------------------
-        if idx % 10 == 0:  # 每10帧保存一次，避免IO太慢
+        # ================= [Module 2: 暴力剪枝 (The Reaper) - Native Fix] =================
+        # 位置：optimize_cur_map 的最末尾 (Loop 结束后，return 前)
+        # 修正：直接调用本类(self)的 prune_points 方法，它已经完美集成了 optimizer。
+        
+        if True: 
+            with torch.no_grad():
+                # 1. 获取当前高斯状态
+                opacity = self.gaussians.get_opacity()      
+                scaling = self.gaussians.get_scaling()      
+                xyz = self.gaussians.get_xyz()              
+                
+                # 计算属性
+                max_scaling = scaling.max(dim=1).values     
+                cam_center = cur_c2w[:3, 3]
+                dist_to_cam = torch.norm(xyz - cam_center, dim=1) 
+
+                # ---------------------------------------------------------
+                # 策略 A: 巨人杀手 (Giant Slayer)
+                # ---------------------------------------------------------
+                giant_thresh = 0.5 # 50cm
+                giant_mask = max_scaling > giant_thresh
+
+                # ---------------------------------------------------------
+                # 策略 B: 近景净化 (Near-Field Sanitizer)
+                # ---------------------------------------------------------
+                near_dist_thresh = 1.2   
+                near_scale_thresh = 0.05 
+                near_mask = dist_to_cam < near_dist_thresh
+                near_giant_mask = near_mask & (max_scaling > near_scale_thresh)
+
+                # ---------------------------------------------------------
+                # 策略 C: 噪点清洗 (Noise Filter)
+                # ---------------------------------------------------------
+                # 注意：这里我们使用 self.gaussians_opacity_grad 还是 opacity?
+                # 因为在 Loop 结束后，self.gaussians 里的值是最新的。
+                # 阈值：0.05
+                opacity_thresh = 0.05
+                noise_mask = (opacity < opacity_thresh).squeeze()
+
+                # ---------------------------------------------------------
+                # 执行处决
+                # ---------------------------------------------------------
+                kill_mask = giant_mask | near_giant_mask | noise_mask
+                
+                num_killed = kill_mask.sum().item()
+                num_total = xyz.shape[0]
+                
+                if num_killed > 0:
+                    # [关键修正] 调用当前类的 prune_points (它会自动处理 self.optimizer)
+                    self.prune_points(kill_mask)
+                    
+                    # [重要] 剪枝后需要手动更新模型中的点数记录，否则下一次 add_points 可能会错位
+                    self.gaussians._pts_num = self.gaussians.get_xyz().shape[0]
+                    
+                    print(f"[Module 2 Prune] Keyframe {idx}: "
+                          f"Killed {num_killed} / {num_total} points. "
+                          f"(Giants: {giant_mask.sum().item()}, "
+                          f"NearArtifacts: {near_giant_mask.sum().item()}, "
+                          f"Noise: {noise_mask.sum().item()})")
+        # ================= [可视化 V2：显形模式] =================
+        if True:
             with torch.no_grad():
                 try:
-                    # 1. 获取当前所有高斯点
                     xyz = self.gaussians.get_xyz()
-                    
-                    # 2. 投影到当前相机平面
-                    # World -> Camera
+                    # [新增] 获取 Scale，用于画圈
+                    scales = self.gaussians.get_scaling() 
+                    # 取 Scale 的最大分量作为可视化半径的参考 (简单近似)
+                    max_scales = scales.max(dim=1).values 
+
                     w2c = torch.inverse(cur_c2w)
-                    R = w2c[:3, :3]
-                    T = w2c[:3, 3]
+                    R = w2c[:3, :3]; T = w2c[:3, 3]
                     pts_cam = (xyz @ R.T) + T
                     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
                     
-                    # 3. 过滤掉背后的点和太远的点
-                    valid_mask = (z > 0.01) & (z < 10.0)
+                    # [修正 1] 放宽深度限制到 100米 (和渲染器一致)
+                    valid_mask = (z > 0.01) & (z < 100.0) 
+                    
+                    # 投影
                     u = (x[valid_mask] / z[valid_mask] * self.fx + self.cx).long()
                     v = (y[valid_mask] / z[valid_mask] * self.fy + self.cy).long()
+                    s = max_scales[valid_mask] # 获取对应点的 scale
                     
-                    # 4. 过滤掉图像外的点
                     H, W = self.H, self.W
                     valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-                    u = u[valid_uv].cpu().numpy()
-                    v = v[valid_uv].cpu().numpy()
                     
-                    # 5. 绘制
-                    # 创建一个黑色背景图
+                    u_final = u[valid_uv].cpu().numpy()
+                    v_final = v[valid_uv].cpu().numpy()
+                    s_final = s[valid_uv].cpu().numpy()
+                    
+                    # 绘制
                     viz_img = np.zeros((H, W, 3), dtype=np.uint8)
-                    # 将点绘制为白色 (或者根据深度绘制颜色)
-                    viz_img[v, u] = [255, 255, 255]
                     
-                    # 保存
-                    save_dir = os.path.join(self.output, 'debug_distribution')
+                    # [修正 2] 绘制实心圆，半径与 Scale 成正比
+                    # 这里的半径计算是粗略的，为了视觉显著，我们把 scale 放大一些
+                    for i in range(len(u_final)):
+                        # 简单的透视投影半径估计: radius = scale * fx / z
+                        # 这里我们简化处理，直接给一个基础大小 + scale 因子
+                        radius = max(1, int(s_final[i] * 50)) 
+                        # 如果是巨大的点，画成红色以示警
+                        color = (0, 0, 255) if radius > 5 else (255, 255, 255)
+                        cv2.circle(viz_img, (u_final[i], v_final[i]), radius, color, -1)
+                    
+                    save_dir = os.path.join(self.output, 'debug_distribution_fixed')
                     os.makedirs(save_dir, exist_ok=True)
-                    cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_points.png'), viz_img)
+                    cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_points_reveal.png'), viz_img)
+                    
+                    print(f"[Viz Check] Frame {idx}: Saved revealed point cloud (Z<100m).")
                     
                 except Exception as e:
-                    print(f"Viz Error 1: {e}")
-        # ---------------------------------------------------------
+                    print(f"Viz Error: {e}")
 
-        # [新增可视化实验 2] 验证"鬼影"：可视化深度残差图
-        # ---------------------------------------------------------
-        if idx % 10 == 0:
-            with torch.no_grad():
-                try:
-                    # 1. 渲染当前视角的深度
-                    camera_center = cur_c2w[:3, 3]
-                    world_view_transform = torch.inverse(cur_c2w).transpose(0, 1)
-                    
-                    # 使用正常的 opacity (不 boost) 来观察真实渲染情况
-                    render_pkg = render(self.gaussians.get_xyz(), 
-                                        self.gaussians.get_features_dc(), 
-                                        self.gaussians.get_features_rest(),
-                                        self.opacity_activation(self.gaussians.get_opacity()), 
-                                        self.scaling_activation(self.gaussians.get_scaling()),
-                                        self.rotation_activation(self.gaussians.get_rotation()),
-                                        self.gaussians.get_active_sh_degree(), 
-                                        self.gaussians.get_max_sh_degree(),
-                                        camera_center, world_view_transform, self.projection_matrix, 
-                                        self.fovx, self.fovy, self.H, self.W)
-                    
-                    depth_render = render_pkg["depth"][0] # [H, W]
-                    
-                    # 2. 计算残差 (GT - Render)
-                    # 我们只关心 GT > Render 的情况 (遮挡/鬼影)
-                    # 或者是绝对差值
-                    diff = cur_gt_depth - depth_render
-                    
-                    # 3. 归一化以便可视化
-                    # 设定一个观察范围，例如 [-0.5m, 0.5m]
-                    diff_np = diff.cpu().numpy()
-                    
-                    # 制作热力图: 
-                    # 正值(红/暖色) = Render太近(鬼影挡路)
-                    # 负值(蓝/冷色) = Render太远(穿透)
-                    # 0值(白/灰) = 准确
-                    
-                    # 简单的灰度图可视化 (绝对误差)
-                    diff_abs = np.abs(diff_np)
-                    diff_vis = np.clip(diff_abs / 0.5, 0, 1) * 255 # 0.5m 对应 255
-                    diff_vis = diff_vis.astype(np.uint8)
-                    diff_heatmap = cv2.applyColorMap(diff_vis, cv2.COLORMAP_JET)
-                    
-                    # 另外保存一个 Signed Difference (有符号差值)
-                    # Shift 0 to 127
-                    diff_signed = np.clip((diff_np + 0.5) / 1.0 * 255, 0, 255).astype(np.uint8)
-                    
-                    save_dir = os.path.join(self.output, 'debug_residual')
-                    os.makedirs(save_dir, exist_ok=True)
-                    cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_diff_abs.png'), diff_heatmap)
-                    cv2.imwrite(os.path.join(save_dir, f'{idx:05d}_diff_signed.png'), diff_signed)
-                    
-                except Exception as e:
-                    print(f"Viz Error 2: {e}")
-        # ---------------------------------------------------------
+        
         if self.encode_exposure and idx == (self.n_img - 1):
             self.exposure_feat_all.append(self.exposure_feat.detach().cpu())
         return None
@@ -1087,8 +1205,8 @@ class gs_tracking_mapping():
                 # 6. 分级处决 (Hierarchical Execution)
                 point_ages = current_frame_idx - creation_ids
                 prune_thresholds = torch.ones_like(ghost_counts) * 3 
-                prune_thresholds[point_ages > 30] = 10
-                prune_thresholds[point_ages > 100] = 50
+                prune_thresholds[point_ages > 3] = 10
+                prune_thresholds[point_ages > 10] = 50
                 
                 death_mask = (ghost_counts > prune_thresholds)
                 
@@ -1756,9 +1874,41 @@ class gs_tracking_mapping():
             if self.BA:
                 cur_c2w = _
                 self.estimate_c2w_list[idx] = cur_c2w
+                
+        # 1. 计算当前帧的动态比例 (假设 seg_mask 中 0 或 False 代表动态物体，根据你的 mask 定义调整)
+        # 假设 seg_mask: 1=Static, 0=Dynamic
+        current_dynamic_ratio = 1.0 - (seg_mask.sum().item() / seg_mask.numel())
+        
+        # 2. 定义"动态物体离开"事件 (Disocclusion Event)
+        # 条件：上一帧动态多 (>5%)，当前帧动态少 (<1%)，说明刚走
+        obj_left_view = (self.last_dynamic_ratio > 0.05) and (current_dynamic_ratio < 0.01)
+        
+        # 3. 定义"冷却时间" (防止密集插入)
+        # 至少间隔 5 帧才允许插入这类特殊关键帧
+        min_interval = 5 
+        frames_since_last = idx - self.last_keyframe_idx
+        is_cooled_down = frames_since_last > min_interval
 
-        if (idx % self.keyframe_every == 0 or (idx == self.n_img-2)) and (idx not in self.keyframe_list) and (not torch.isinf(gt_c2w).any()) and (not torch.isnan(gt_c2w).any()):
+        # 更新状态
+        self.last_dynamic_ratio = current_dynamic_ratio
+
+        # 4. 修改判断逻辑
+        # 原逻辑：(idx % self.keyframe_every == 0)
+        # 新逻辑：(原逻辑) OR (物体离开 AND 冷却完毕)
+        
+        is_standard_keyframe = (idx % self.keyframe_every == 0)
+        is_special_keyframe = (obj_left_view and is_cooled_down)
+
+        if (is_standard_keyframe or is_special_keyframe or (idx == self.n_img - 2)) and \
+           (idx not in self.keyframe_list) and \
+           (not torch.isinf(gt_c2w).any()) and (not torch.isnan(gt_c2w).any()):
+            
             self.keyframe_list.append(idx)
+            self.last_keyframe_idx = idx # 更新最后关键帧ID
+            
+            if is_special_keyframe:
+                print(f"[Keyframe Strategy] Frame {idx} added as keyframe due to DISOCCLUSION!")
+
             dic_of_cur_frame = {'gt_c2w': gt_c2w.detach(), 'idx': idx, 'color': gt_color.detach(),
                                 'depth': gt_depth.detach(), 'est_c2w': cur_c2w.detach().clone(), "seg_mask": seg_mask.detach()}
             if self.use_dynamic_radius:
