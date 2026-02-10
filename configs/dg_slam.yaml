@@ -51,11 +51,11 @@ mapping:
   save_selected_keyframes_info: True # saves the keyframes selected at the current mapping frame
   pixels: 1000 # number of sampled rays per frame. M in paper.
   pixels_adding: 10000 # number of pixels choosing for adding points. X in paper.
-  pixels_based_on_color_grad: 1000 # Y in paper.
+  pixels_based_on_color_grad: 0 # Y in paper.
   pixels_based_on_render: True
   add_pixel_depth_th: 0.05
   iters_first: 1500 # how many iterations of optimizer for first frame
-  iters: 200 
+  iters: 300 
   min_iter_ratio: 0.95 # mapping iteration lower bound parameter. See supplementary material
   init:
     geometry:

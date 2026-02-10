@@ -406,132 +406,140 @@ class gs_tracking_mapping():
         # ==============================================================================================
         # 1. 自适应增点 (Adaptive Densification)
         # ==============================================================================================
+        refined_mask = seg_mask
+        frame_pts_add = 0
+
         if idx == 0:
-            # [修改] 去掉平方项，改为线性或恒定，防止远景初始化过多噪点
-            # 设定一个温和的深度系数，例如最多 1.5 倍
-            depth_factor = torch.clamp(gt_depth.median() / 2.5, min=1.0, max=1.5).item()
-            add_pts_num = int(self.pixels_adding * depth_factor * 4) 
+            # 使用恒定数量，保证均匀分布，细节留给 Module 1 去补
+            add_pts_num = self.pixels_adding * 6
         else:
             add_pts_num = max(self.pixels_adding // 5, 600)
         # 修正: Mask 直接使用传入的 seg_mask (1=Static)
-        refined_mask = seg_mask
+        
 
         # 随机采样 (Random Sampling)
-        batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples(
-            0, H, 0, W, add_pts_num,
-            fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device, depth_filter=True, return_index=True, seg_mask = refined_mask)
-        
-        # --- Warp Logic ---
-        keyframe_len = idx
-        warp_window = 3
-        warp_depth_img_batch = []
-        warp_pose_batch = []
-        warp_gt_pose_batch = []
-        if keyframe_len >= warp_window:
-            for frame_id in range(1, warp_window + 1):
-                query_id = frame_id * (-1)
-                tmp_gt_depth = self.video.depths_gt[idx + query_id]
-                tmp_gt_c2w = self.video.poses_gt[idx + query_id] 
-                tmp_est_c2w = self.estimate_c2w_list[idx + query_id].cuda() 
+        if idx == 0:
+            batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples(
+                0, H, 0, W, add_pts_num,
+                fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device, depth_filter=True, return_index=True, seg_mask = refined_mask)
+            
+            # --- Warp Logic ---
+            keyframe_len = idx
+            warp_window = 3
+            warp_depth_img_batch = []
+            warp_pose_batch = []
+            warp_gt_pose_batch = []
+            if keyframe_len >= warp_window:
+                for frame_id in range(1, warp_window + 1):
+                    query_id = frame_id * (-1)
+                    tmp_gt_depth = self.video.depths_gt[idx + query_id]
+                    tmp_gt_c2w = self.video.poses_gt[idx + query_id] 
+                    tmp_est_c2w = self.estimate_c2w_list[idx + query_id].cuda() 
 
-                warp_pose_batch += [tmp_est_c2w]
-                warp_depth_img_batch += [tmp_gt_depth]
-                tmp_gt_c2w = torch.from_numpy(pose_matrix_from_quaternion(tmp_gt_c2w.cpu())).cuda()
-                warp_gt_pose_batch += [tmp_gt_c2w]
-        else:
-            for frame_id in range(1, keyframe_len + 1):
-                query_id = frame_id * (-1)
-                tmp_gt_depth = self.video.depths_gt[idx + query_id] 
-                tmp_gt_c2w = self.video.poses_gt[idx + query_id]
-                tmp_est_c2w = self.estimate_c2w_list[idx + query_id].cuda()
-                warp_pose_batch += [tmp_est_c2w]
-                warp_depth_img_batch += [tmp_gt_depth]
-                tmp_gt_c2w = torch.from_numpy(pose_matrix_from_quaternion(tmp_gt_c2w.cpu())).cuda()
-                warp_gt_pose_batch += [tmp_gt_c2w]
-        
-        if idx > 0:
-            warp_depth_batch = torch.stack(warp_depth_img_batch, dim=0)
-            warp_est_pose_batch = torch.stack(warp_pose_batch, dim=0)
-            warp_gt_pose_batch = torch.stack(warp_gt_pose_batch, dim=0)
-            intrinsic = np.array([self.fx, self.fy, self.cx, self.cy])
-            batch_mask = depth_warp_pixel(cur_c2w, warp_est_pose_batch, cur_gt_depth.unsqueeze(-1), warp_depth_batch.unsqueeze(-1), cur_gt_depth,
-                               intrinsic, H, W, batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_depth)
-            batch_rays_o = batch_rays_o[batch_mask]
-            batch_rays_d = batch_rays_d[batch_mask]
-            batch_gt_depth = batch_gt_depth[batch_mask]
-            batch_gt_color = batch_gt_color[batch_mask]
-            i = i[batch_mask]
-            j = j[batch_mask]
-        
-        # [Fix] Initialize frame_pts_add
-        frame_pts_add = 0
+                    warp_pose_batch += [tmp_est_c2w]
+                    warp_depth_img_batch += [tmp_gt_depth]
+                    tmp_gt_c2w = torch.from_numpy(pose_matrix_from_quaternion(tmp_gt_c2w.cpu())).cuda()
+                    warp_gt_pose_batch += [tmp_gt_c2w]
+            else:
+                for frame_id in range(1, keyframe_len + 1):
+                    query_id = frame_id * (-1)
+                    tmp_gt_depth = self.video.depths_gt[idx + query_id] 
+                    tmp_gt_c2w = self.video.poses_gt[idx + query_id]
+                    tmp_est_c2w = self.estimate_c2w_list[idx + query_id].cuda()
+                    warp_pose_batch += [tmp_est_c2w]
+                    warp_depth_img_batch += [tmp_gt_depth]
+                    tmp_gt_c2w = torch.from_numpy(pose_matrix_from_quaternion(tmp_gt_c2w.cpu())).cuda()
+                    warp_gt_pose_batch += [tmp_gt_c2w]
+            
+            if idx > 0:
+                warp_depth_batch = torch.stack(warp_depth_img_batch, dim=0)
+                warp_est_pose_batch = torch.stack(warp_pose_batch, dim=0)
+                warp_gt_pose_batch = torch.stack(warp_gt_pose_batch, dim=0)
+                intrinsic = np.array([self.fx, self.fy, self.cx, self.cy])
+                batch_mask = depth_warp_pixel(cur_c2w, warp_est_pose_batch, cur_gt_depth.unsqueeze(-1), warp_depth_batch.unsqueeze(-1), cur_gt_depth,
+                                intrinsic, H, W, batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_depth)
+                batch_rays_o = batch_rays_o[batch_mask]
+                batch_rays_d = batch_rays_d[batch_mask]
+                batch_gt_depth = batch_gt_depth[batch_mask]
+                batch_gt_color = batch_gt_color[batch_mask]
+                i = i[batch_mask]
+                j = j[batch_mask]
+            
+            # [Fix] Initialize frame_pts_add
 
-        if not color_refine:
-            _ = self.gaussians.add_neural_points(batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color,
+            if not color_refine:
+                _ = self.gaussians.add_neural_points(batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color,
                                                  dynamic_radius=self.dynamic_r_add[
                                                      j, i] if self.use_dynamic_radius else None,
                                                  current_frame_id=idx.item())
-            frame_pts_add += _  # Accumulate added points
+                frame_pts_add += _  # Accumulate added points
 
             # ======================================================================================
             # 2. 梯度采样 + 静态遮罩门禁
             # ======================================================================================
-            if self.pixels_based_on_color_grad > 0:
-                # [修改] 显式传入 seg_mask=refined_mask，让采样在源头就避开动态物体
-                batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples_with_pixel_grad(
-                    0, H, 0, W, self.pixels_based_on_color_grad,
-                    H, W, fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device,
-                    depth_filter=True, return_index=True, 
-                    seg_mask=refined_mask) # <--- 插入这一行参数
+            # if self.pixels_based_on_color_grad > 0:
+            #     # [修改] 显式传入 seg_mask=refined_mask，让采样在源头就避开动态物体
+            #     batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples_with_pixel_grad(
+            #         0, H, 0, W, self.pixels_based_on_color_grad,
+            #         H, W, fx, fy, cx, cy, cur_c2w, gt_depth, gt_color, self.device,
+            #         depth_filter=True, return_index=True, 
+            #         seg_mask=refined_mask) # <--- 插入这一行参数
                 
-                # 边界安全检查 + Mask 过滤 (这部分可以保留作为双重保险，或者应对索引越界)
-                if refined_mask is not None:
-                    MH, MW = refined_mask.shape
-                    valid_mask_indices = (i >= 0) & (i < MH) & (j >= 0) & (j < MW)
+            #     # 边界安全检查 + Mask 过滤 (这部分可以保留作为双重保险，或者应对索引越界)
+            #     if refined_mask is not None:
+            #         MH, MW = refined_mask.shape
+            #         valid_mask_indices = (i >= 0) & (i < MH) & (j >= 0) & (j < MW)
                     
-                    is_static = torch.zeros_like(i, dtype=torch.bool)
+            #         is_static = torch.zeros_like(i, dtype=torch.bool)
                     
-                    if valid_mask_indices.any():
-                        valid_i = i[valid_mask_indices]
-                        valid_j = j[valid_mask_indices]
-                        is_static[valid_mask_indices] = refined_mask[valid_i, valid_j]
+            #         if valid_mask_indices.any():
+            #             valid_i = i[valid_mask_indices]
+            #             valid_j = j[valid_mask_indices]
+            #             is_static[valid_mask_indices] = refined_mask[valid_i, valid_j]
 
-                    if is_static.sum() > 0:
-                        _ = self.gaussians.add_neural_points(
-                            batch_rays_o[is_static], batch_rays_d[is_static], 
-                            batch_gt_depth[is_static], batch_gt_color[is_static], 
-                            is_pts_grad=True, 
-                            dynamic_radius=self.dynamic_r_add[j[is_static], i[is_static]] if self.use_dynamic_radius else None,
-                            current_frame_id=idx.item()
-                        )
-                        frame_pts_add += _  # Accumulate
-                else:
-                    _ = self.gaussians.add_neural_points(
-                        batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, 
-                        is_pts_grad=True, 
-                        dynamic_radius=self.dynamic_r_add[j, i] if self.use_dynamic_radius else None,
-                        current_frame_id=idx.item()
-                    )
-                    frame_pts_add += _  # Accumulate
-
-        # ================= [Module 1 Update]: 中值几何校验 (Median Geometry Check) =================
+            #         if is_static.sum() > 0:
+            #             _ = self.gaussians.add_neural_points(
+            #                 batch_rays_o[is_static], batch_rays_d[is_static], 
+            #                 batch_gt_depth[is_static], batch_gt_color[is_static], 
+            #                 is_pts_grad=True, 
+            #                 dynamic_radius=self.dynamic_r_add[j[is_static], i[is_static]] if self.use_dynamic_radius else None,
+            #                 current_frame_id=idx.item()
+            #             )
+            #             frame_pts_add += _  # Accumulate
+            #     else:
+            #         _ = self.gaussians.add_neural_points(
+            #             batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, 
+            #             is_pts_grad=True, 
+            #             dynamic_radius=self.dynamic_r_add[j, i] if self.use_dynamic_radius else None,
+            #             current_frame_id=idx.item()
+            #         )
+            #         frame_pts_add += _  # Accumulate
+        # ================= [Module 1 Refined]: 联合密度与梯度采样 (含可视化) =================
+        # [逻辑]：只在渲染密度不足(Density low) 且 (有纹理 OR 有几何边缘 OR 有空洞) 的地方加点
         if True: 
             with torch.no_grad():
-                refined_mask = seg_mask 
-
-                # 1. 准备深度数据
+                # --- 1. 准备数据 ---
                 depth_np = cur_gt_depth.cpu().numpy()
+                mask_static = refined_mask if refined_mask is not None else torch.ones_like(cur_gt_depth, dtype=torch.bool)
                 
-                # [核心创新]: 使用 3x3 中值滤波来判断"飞点"
-                # 逻辑：真实的几何边缘在 3x3 邻域内通常有支撑，而噪声(飞点)是孤立的
+                # [自适应飞点检测] 阈值随深度增加：0.02 * depth + 0.01 (4m处允许9cm误差)
                 depth_median = cv2.medianBlur(depth_np, 3)
                 depth_diff = np.abs(depth_np - depth_median)
-                
-                # 定义"飞点掩码": 深度与邻域中值差异超过 5cm 的，视为不可信噪声
-                flying_pixel_mask = torch.from_numpy(depth_diff > 0.05).to(self.device)
+                adaptive_threshold = 0.02 * depth_np + 0.01 
+                flying_pixel_mask = torch.from_numpy(depth_diff > adaptive_threshold).to(self.device)
 
-                # 2. 计算渲染密度 (Density Map)
-                # ... (保持原有的 render 和 density_map 计算逻辑不变) ...
+                # [计算纹理梯度]
+                gray = 0.299 * cur_gt_color[:,:,0] + 0.587 * cur_gt_color[:,:,1] + 0.114 * cur_gt_color[:,:,2]
+                grad_y, grad_x = torch.gradient(gray)
+                grad_mag = torch.sqrt(grad_x**2 + grad_y**2)
+                
+                # [计算深度边缘] (新增：防止边缘处空缺)
+                d_grad_y, d_grad_x = torch.gradient(cur_gt_depth)
+                d_grad_mag = torch.sqrt(d_grad_x**2 + d_grad_y**2)
+                is_depth_edge = d_grad_mag > 0.05 
+
+                # --- 2. 渲染 (获取 opacity_map) ---
+                # 依然是渲染，但我们不需要再手动算 density_map 了
                 render_pkg = render(
                     self.gaussians.get_xyz(), 
                     self.gaussians.get_features_dc(), 
@@ -546,52 +554,53 @@ class gs_tracking_mapping():
                     self.projection_matrix, 
                     self.fovx, self.fovy, self.H, self.W
                 )
-                viewspace_pts = render_pkg["viewspace_points"]
-                visible_mask = render_pkg["visibility_filter"]
-                valid_pts = viewspace_pts[visible_mask]
-                pts_x = (valid_pts[:, 0] / 2.0 + 0.5) * self.W 
-                pts_y = (valid_pts[:, 1] / 2.0 + 0.5) * self.H
-                pts_x = pts_x.long().clamp(0, self.W - 1)
-                pts_y = pts_y.long().clamp(0, self.H - 1)
-                density_map = torch.zeros((self.H, self.W), device=self.device, dtype=torch.float32)
-                flat_indices = pts_y * self.W + pts_x
-                ones = torch.ones_like(flat_indices, dtype=torch.float32)
-                density_map.view(-1).scatter_add_(0, flat_indices, ones)
+                
+                # [核心升级]：直接使用渲染器输出的累积不透明度 (Alpha Map)
+                # Opacity map shape: [H, W], range [0, 1]
+                opacity_map = render_pkg["acc"][0] 
 
-                # 3. 计算纹理梯度 (保留，用于优先在纹理处加点)
-                gray = 0.299 * cur_gt_color[:,:,0] + 0.587 * cur_gt_color[:,:,1] + 0.114 * cur_gt_color[:,:,2]
-                sobel_x = torch.abs(gray[:, 1:] - gray[:, :-1])
-                sobel_y = torch.abs(gray[1:, :] - gray[:-1, :])
-                grad_mag = torch.zeros_like(gray)
-                grad_mag[:, 1:] += sobel_x
-                grad_mag[1:, :] += sobel_y
+                # --- 3. 核心决策逻辑 (基于重建程度) ---
                 
-                # 4. 组合 Mask
-                # 基础条件：静态 + 深度有效 + [不是飞点]
-                # 注意：我们不再避开边缘，而是避开"飞点"！
-                mask_np = refined_mask.cpu().numpy().astype(np.uint8)
-                kernel = np.ones((3, 3), np.uint8) 
-                mask_eroded = cv2.erode(mask_np, kernel, iterations=1)
-                safe_static_mask = torch.from_numpy(mask_eroded).bool().to(self.device)
+                # 基础安全区 (不变)
+                base_condition = mask_static & (cur_gt_depth > 0.01) & (~flying_pixel_mask)
                 
-                base_condition = safe_static_mask & (cur_gt_depth > 0.1) & (~flying_pixel_mask)
+                # 策略 A: 严重空洞 (Opacity < 0.1) -> 必须补
+                # 即使没有纹理，如果是空的，也得填上
+                cond_hole = (opacity_map < 0.1)
                 
-                # 策略 A: 补洞 (Density=0) -> 必须补，不管有没有纹理
-                fill_hole_mask = base_condition & (density_map == 0)
+                # 策略 B: 细节完善 (Opacity < 0.95 且 有细节) -> 补
+                # 注意：如果 Opacity > 0.95，说明已经重建得很扎实了，就不加了，避免冗余
+                # 这里的 0.95 是个经验值，既保证了实心，又留了一点余地给边缘优化
+                cond_detail = (opacity_map < 0.95) & ((grad_mag > 0.02) | is_depth_edge)
                 
-                # 策略 B: 增强纹理 (Density<3 且 有纹理) -> 允许在边缘加点！
-                # 只要不是飞点，真实的图像边缘我们现在允许加点了
-                fill_texture_mask = base_condition & (density_map < 3) & (grad_mag > 0.05)
+                target_mask = base_condition & (cond_hole | cond_detail)
+
+                # --- 4. 可视化 (更新为显示 Opacity) ---
+                if idx % 1 == 0: 
+                    debug_dir = os.path.join(self.output, 'debug_sampling_mask')
+                    os.makedirs(debug_dir, exist_ok=True)
+                    
+                    vis_img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+                    
+                    # 红色：飞点 (被剔除的)
+                    vis_img[:, :, 2] = (flying_pixel_mask.cpu().numpy() * 255).astype(np.uint8) 
+                    # 绿色：最终加点位置
+                    vis_img[:, :, 1] = (target_mask.cpu().numpy() * 255).astype(np.uint8)
+                    # 蓝色：重建程度 (越亮越实) -> 这次你有蓝色看了！
+                    # 如果蓝色很黑，说明重建不充分；如果蓝色很亮(白色)，说明重建好了
+                    vis_img[:, :, 0] = (opacity_map.cpu().numpy() * 255).astype(np.uint8)
+                    
+                    cv2.imwrite(os.path.join(debug_dir, f'mask_{idx:05d}.png'), vis_img)
                 
-                target_mask = fill_hole_mask | fill_texture_mask
-                
+
+                # --- 5. 执行加点 ---
                 num_fill = target_mask.sum().item()
-
                 if num_fill > 0:
-                    # [恢复预算] 恢复到 2000，保证点数回升
-                    fill_budget = 2000 
+                    fill_budget = 6000 # 预算可以给足，因为Mask已经过滤得很好了
                     candidates = torch.nonzero(target_mask)
+                    
                     if candidates.shape[0] > fill_budget:
+                        # 简单的随机采样
                         indices = torch.randperm(candidates.shape[0])[:fill_budget]
                         selected_coords = candidates[indices]
                     else:
@@ -611,10 +620,11 @@ class gs_tracking_mapping():
                     rays_d = rays_d / (torch.norm(rays_d, dim=-1, keepdim=True) + 1e-7)
                     rays_o = cam_center.expand_as(rays_d)
                     
-                    self.gaussians.add_neural_points(
+                    _ = self.gaussians.add_neural_points(
                         rays_o, rays_d, depth_new, color_new,
                         current_frame_id = idx.item()
                     )
+                    frame_pts_add += _
           
             
 
@@ -738,13 +748,12 @@ class gs_tracking_mapping():
             optim_para_list.append({'params': self.exposure_feat, 'lr': 0.001, "name": "expos_feat"})
             optim_para_list.append({'params': mlp_exposure_para_list, 'lr': 0.005, "name": "mlp_expos_para"})
         self.optimizer = torch.optim.Adam(optim_para_list)
-
-        if idx > 0 and not color_refine:
-            num_joint_iters = 60
-            num_joint_iters = np.clip(int(num_joint_iters * frame_pts_add / 5000), int(
-                self.min_iter_ratio * num_joint_iters), 2 * num_joint_iters)
-        
-        num_joint_iters = max(num_joint_iters, 60)
+        # [强力修复] 显式控制迭代次数，不让任何潜规则作祟
+        if idx == 0:
+            num_joint_iters = 1500 # 强制第0帧跑1500次
+            print(f"DEBUG: Frame 0, force iters to {num_joint_iters}")
+        elif not color_refine:
+            num_joint_iters = 300  # 后续帧跑300次
         
         actual_joint_iters = 0
 
@@ -794,7 +803,9 @@ class gs_tracking_mapping():
                 image = torch.sigmoid(image)
                 image = image.reshape(self.H, self.W, 3)
             
-            if joint_iter % 30 == 0:
+            sh_up_interval = max(num_joint_iters // 3, 50) 
+            
+            if joint_iter > 0 and joint_iter % sh_up_interval == 0:
                 self.gaussians.oneupSHdegree()
 
             mask = (gt_depth > 0.0) & (gt_depth < 8.) & refined_mask
@@ -803,9 +814,7 @@ class gs_tracking_mapping():
             gt_depths_wmask = gt_depth[mask]
 
             # [修改] 引入距离权重衰减 (Depth Confidence Decay)
-            # 远于 4m 的点，几何权重降为 0.1；近处保持 1.0
-            dist_weights = torch.ones_like(gt_depths_wmask)
-            dist_weights[gt_depths_wmask > 4.0] = 0.1 
+            dist_weights = 1.0 / (1.0 + 0.1 * gt_depths_wmask)
             
             # 应用权重
             geo_loss = (torch.abs(gt_depths_wmask - depths_wmask) * dist_weights).sum()
@@ -867,7 +876,7 @@ class gs_tracking_mapping():
                 # 之前的 opacity_thresh = 0.1 且无视年龄，导致老点也被杀光了
                 
                 # 1. 垃圾清理：年轻(Age<5) 且 透明度低(<0.1) -> 杀
-                mask_noise_young = (opacity.squeeze() < 0.10) & (~is_old)
+                mask_noise_young = (opacity.squeeze() < 0.05) & (~is_old)
                 
                 # 2. 深度清理：极度透明(<0.01) -> 无论多老都杀 (防止显存溢出)
                 mask_noise_dead = opacity.squeeze() < 0.01
@@ -1269,7 +1278,7 @@ class gs_tracking_mapping():
 
         self.optimizer = torch.optim.Adam(optim_para_list)
         if idx > 0 and not color_refine:
-            num_joint_iters = 100
+            num_joint_iters = 300
 
         total_gs_point_num = self.gaussians.get_xyz().shape[0]
         print('total gaussian points number: ', f'{total_gs_point_num}')
@@ -1362,7 +1371,9 @@ class gs_tracking_mapping():
                 gt_depths.append(gt_depth.unsqueeze(0))
                 seg_masks.append(seg_mask.unsqueeze(0))
 
-            if joint_iter % 30 == 0:
+            sh_interval = max(num_joint_iters // 3, 30) 
+            
+            if joint_iter > 0 and joint_iter % sh_interval == 0:
                 self.gaussians.oneupSHdegree()
 
             images = torch.cat(images)
@@ -1379,8 +1390,7 @@ class gs_tracking_mapping():
             # [新增修改] 同样应用距离权重衰减
             # 这里的 gt_depths_wmask 包含了所有选定帧的所有有效像素深度
             # 逻辑和 optimize_cur_map 一样：远于 4m 的给低权重
-            dist_weights = torch.ones_like(gt_depths_wmask)
-            dist_weights[gt_depths_wmask > 4.0] = 0.1 
+            dist_weights = 1.0 / (1.0 + 0.1 * gt_depths_wmask)
             
             # 应用权重计算 Loss
             geo_loss = (torch.abs(gt_depths_wmask - depths_wmask) * dist_weights).sum()
